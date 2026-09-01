@@ -76,20 +76,48 @@ get_timeout_cmd() {
     fi
 }
 
+# Resolve a codex binary that actually runs.
+# On Windows/Git Bash the npm `codex` shell shim can resolve node to a placeholder
+# stub under node_modules/node ("This file intentionally left blank") while the .cmd
+# wrapper works fine. Probing with --version catches that; `command -v` does not.
+CODEX_BIN="${CODEX_BIN:-}"
+resolve_codex_bin() {
+    local candidate
+    for candidate in codex codex.cmd; do
+        command -v "$candidate" &> /dev/null || continue
+        if "$candidate" --version &> /dev/null; then
+            CODEX_BIN="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Check dependencies
 check_dependencies() {
     local missing=()
 
-    if ! command -v claude &> /dev/null; then
-        missing+=("claude CLI (npm install -g @anthropic-ai/claude-code)")
-    fi
-
-    if ! command -v codex &> /dev/null; then
-        missing+=("codex CLI (npm install -g @openai/codex)")
-    fi
-
     if ! command -v jq &> /dev/null; then
-        missing+=("jq (brew install jq)")
+        missing+=("jq (choco install jq | winget install jqlang.jq | brew install jq)")
+    fi
+
+    # Agent CLIs are only needed for a real run
+    if [[ "$DRY_RUN" != "1" ]]; then
+        if ! command -v claude &> /dev/null; then
+            missing+=("claude CLI (npm install -g @anthropic-ai/claude-code)")
+        elif ! claude --version &> /dev/null; then
+            missing+=("claude CLI is on PATH but fails to run - check 'claude --version'")
+        fi
+
+        if ! command -v codex &> /dev/null && ! command -v codex.cmd &> /dev/null; then
+            missing+=("codex CLI (npm install -g @openai/codex)")
+        elif ! resolve_codex_bin; then
+            missing+=("codex CLI is on PATH but fails to run - check 'codex --version'")
+        else
+            log_verbose "Using codex binary: $CODEX_BIN"
+        fi
+    else
+        CODEX_BIN="${CODEX_BIN:-codex}"
     fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -320,11 +348,32 @@ run_codex() {
     local timeout_cmd=$(get_timeout_cmd)
     local timeout_secs=$((TIMEOUT_MINUTES * 60))
 
+    # codex >= 0.30 uses the `exec` subcommand; the old `-q --full-auto --prompt` form is gone.
+    # The prompt is piped on stdin rather than passed as an argument: the phase-1 source dump
+    # easily exceeds the ~32KB Windows CreateProcess command-line limit.
+    # read-only sandbox is correct here - only phase 4 (Claude) is allowed to modify files.
+    #
+    # -o/--output-last-message is load-bearing, not a nicety: `codex exec` echoes the whole
+    # prompt plus a banner to stdout, and our prompts contain EXAMPLE status blocks. Capturing
+    # stdout would feed those examples to parse_status_block's sed range match and corrupt the
+    # parsed result. -o writes only the agent's final message.
+    local codex_bin="${CODEX_BIN:-codex}"
+    local codex_log="$LOGS_DIR/$(basename "${output_file%.md}").codex.log"
+    local codex_args=(exec --sandbox read-only --skip-git-repo-check -o "$output_file" -)
+
+    mkdir -p "$LOGS_DIR"
+
     local exit_code=0
     if [[ -n "$timeout_cmd" ]]; then
-        (cd "$working_dir" && $timeout_cmd ${timeout_secs}s codex -q --full-auto --prompt "$prompt") > "$output_file" 2>&1 || exit_code=$?
+        (cd "$working_dir" && printf '%s' "$prompt" | $timeout_cmd ${timeout_secs}s "$codex_bin" "${codex_args[@]}") > "$codex_log" 2>&1 || exit_code=$?
     else
-        (cd "$working_dir" && codex -q --full-auto --prompt "$prompt") > "$output_file" 2>&1 || exit_code=$?
+        (cd "$working_dir" && printf '%s' "$prompt" | "$codex_bin" "${codex_args[@]}") > "$codex_log" 2>&1 || exit_code=$?
+    fi
+
+    # Fall back to the transcript if codex died before writing the final message
+    if [[ ! -s "$output_file" ]]; then
+        log_warning "Codex produced no final message; falling back to transcript"
+        cp "$codex_log" "$output_file" 2>/dev/null || echo "Codex produced no output" > "$output_file"
     fi
 
     if [[ $exit_code -eq 0 ]]; then

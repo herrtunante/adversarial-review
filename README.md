@@ -61,10 +61,19 @@ cd adversarial-review
 
 ## Requirements
 
-- **claude CLI**: `npm install -g @anthropic-ai/claude-code`
-- **codex CLI**: `npm install -g @openai/codex`
-- **jq**: `brew install jq` (macOS) or `apt install jq` (Linux)
-- **coreutils** (macOS only, for timeout): `brew install coreutils`
+- **bash** — the script is bash-only. On Windows run it from Git Bash or WSL, not PowerShell/cmd.
+- **claude CLI**: `npm install -g @anthropic-ai/claude-code` (verified against 2.1.252)
+- **codex CLI**: `npm install -g @openai/codex` (verified against codex-cli 0.147.0; the script
+  uses the `exec` subcommand, so pre-0.30 codex releases will not work)
+- **jq**: `brew install jq` (macOS), `apt install jq` (Linux), or `choco install jq` /
+  `winget install jqlang.jq` (Windows)
+- **coreutils** (macOS only, for `timeout`): `brew install coreutils`
+
+### Windows note
+
+If `codex --version` works in PowerShell but fails in Git Bash, a stray `node_modules/node`
+package under `%APPDATA%\npm\` is shadowing real node with a placeholder binary. The script detects
+this and falls back to `codex.cmd` automatically.
 
 ## Usage
 
