@@ -84,9 +84,16 @@ Markdown artifacts, and the *next* phase's prompt is built by concatenating a te
 | Phase | Function | Agents | Reads | Writes |
 |---|---|---|---|---|
 | 1 Independent review | `run_phase_1` | claude ∥ codex | `collect_source_code` dump | `iter{N}_1_{agent}_review.md` |
-| 2 Cross-review | `run_phase_2` | claude ∥ codex | the *other* agent's phase-1 file | `iter{N}_2_claude_on_codex.md`, `iter{N}_2_codex_on_claude.md` |
-| 3 Meta-review | `run_phase_3` | claude ∥ codex | the critique *of them* from phase 2 | `iter{N}_3_{agent}_meta.md` |
+| 2 Cross-review | `run_phase_2` | claude ∥ codex | the *other* agent's phase-1 file **+ the source dump** | `iter{N}_2_claude_on_codex.md`, `iter{N}_2_codex_on_claude.md` |
+| 3 Meta-review | `run_phase_3` | claude ∥ codex | **its own phase-1 review** + the critique *of it* from phase 2 | `iter{N}_3_{agent}_meta.md` |
 | 4 Synthesis | `run_phase_4` | claude only | all six prior artifacts | `iter{N}_4_synthesis.md` |
+
+Because every invocation is a fresh, stateless CLI call, an agent knows nothing it is not handed in
+the prompt — including **its own previous output**. That is why phase 3 must re-supply the agent's
+phase-1 review: `meta_review.md` asks it to defend or concede specific positions, and without the
+original text it can only work from its critic's paraphrase of those positions. For the same reason
+phase 2 carries the source dump: `cross_review.md` asks the agent to *verify* findings and to add
+issues the other agent missed, neither of which is possible from review prose alone.
 
 Phases 1–3 run their two agents as background jobs and `wait` on both. Phase 4 is the only phase
 that **writes code**: it invokes `claude --print --dangerously-skip-permissions` with the target
@@ -119,10 +126,33 @@ in `tracking.json` as `clean` / `circuit_open` / `max_iterations`.
 ### Circuit breaker (`lib/circuit_breaker.sh`)
 
 A CLOSED → HALF_OPEN → OPEN state machine, fed exactly once per iteration by
-`record_iteration_result` at the end of phase 4, from three signals: `FILES_MODIFIED` from the
-synthesis block, `CONSENSUS_REACHED` from Claude's meta-review, and a SHA-256 of the two phase-1
-review files (identical hash across iterations ⇒ "same issues"). OPEN is terminal and requires
-`--reset-circuit`; `can_execute` is checked at the top of each iteration.
+`record_iteration_result` at the end of phase 4, from three signals. All three are deliberately
+grounded in observable state rather than agent self-report, because each was previously either
+unfalsifiable or dead:
+
+- **Progress** — whether `target_state_hash` (a hash of `git status --porcelain` plus staged and
+  unstaged diffs in the target) changed across phase 4. `FILES_MODIFIED` from the synthesis block
+  is logged for comparison but no longer drives the breaker; it is self-reported, and a missing
+  status block parses to `0`, which read as a stall on what was really a parse failure. Non-git
+  targets fall back to the self-report with a warning.
+- **Consensus** — `CONSENSUS_REACHED` must be `YES` in **both** agents' meta-reviews
+  (`consensus_is_yes`). Reading only Claude's let the breaker record agreement while Codex
+  dissented.
+- **Same issues** — `issues_fingerprint`, the sorted unique set of source-file paths referenced
+  across both phase-1 reviews, lowercased with line numbers stripped. Hashing the raw review prose
+  (the previous approach) never matched across iterations because LLM wording varies, so this
+  trigger could not fire at all. Stripping line numbers matters because they shift as fixes land.
+
+OPEN is terminal and requires `--reset-circuit`; `can_execute` is checked at the top of each
+iteration. Note that a `--dry-run` drives the breaker to OPEN, so reset before a real run.
+
+### Agent failure handling
+
+`wait_for_agents` replaces the old `wait $pid || true`. Exit codes are no longer discarded: a
+single agent failure logs and degrades, both failing returns `2`, which each phase propagates so
+`run_review_loop` halts with `status: agent_failure`. Without this, a crashed or timed-out agent
+produced an artifact with no status block, which parses to zero issues and is indistinguishable
+from a clean review — the loop would burn every remaining iteration on empty input.
 
 ### Source collection is the main scope limit
 
@@ -136,15 +166,19 @@ coverage or the caps happens here, and directly drives prompt size and cost.
 
 - **`-p/--prompt` is destructive**: it `cp`s your file *over* `prompts/initial_review.md`,
   permanently replacing the repo's template. Check `git status` after using it.
-- **Phases 2 and 3 call `run_claude`/`run_codex` without the working-dir argument**, so they
-  default to `$PWD` (this repo) rather than the target. Only phases 1 and 4 run in the target.
+- **Every phase must pass `target_dir` to `run_claude`/`run_codex`.** The third argument defaults
+  to `${3:-$PWD}`, which is the *invocation* directory, not the target. Phases 2 and 3 used to omit
+  it, so cross-review and meta-review ran against this repo instead of the code under review.
 - **`lib/circuit_breaker.sh` and `lib/response_analyzer.sh` each assign `SCRIPT_DIR`**, clobbering
   the main script's. Currently harmless because the main script derives `LIB_DIR`/`PROMPTS_DIR`
   before sourcing — but don't add a post-source use of `SCRIPT_DIR`.
 - **`lib/response_analyzer.sh` is dead code.** It is sourced, but none of `analyze_response`,
   `compare_responses`, `analyze_cross_review`, or `store_analysis` are ever called; the main script
-  uses its own `parse_status_block` instead. Same for `format_duration`/`get_epoch_seconds` in
-  `date_utils.sh`. Wire them in or delete them rather than assuming they run.
+  uses its own `parse_status_block` and `issues_fingerprint` instead. Same for
+  `format_duration`/`get_epoch_seconds` in `date_utils.sh`. Wire them in or delete them rather than
+  assuming they run.
+- **Hash via the `sha256_hash` helper**, not `shasum` directly — it falls back across
+  `sha256sum`/`shasum`/`cksum` so the circuit breaker works on Linux, macOS, and Git Bash alike.
 - **`set -e` + `((i++))`**: incrementing from 0 returns exit 1 and would kill the script. Existing
   code uses `((iteration++)) || true`; keep that pattern.
 - Timeouts go through `get_timeout_cmd`, preferring `gtimeout` (macOS coreutils) then `timeout`.

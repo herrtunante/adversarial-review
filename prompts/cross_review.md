@@ -34,6 +34,12 @@ Follow the same format as Phase 1:
 
 ## Adversarial Perspective
 
+The source code is supplied below the other agent's review, and your working
+directory is the target project. Verification is therefore mandatory, not
+optional: check each claim against the actual code before validating or
+challenging it. Cite the file and line you checked. A finding you could not
+verify against the source is UNCLEAR, not VALID.
+
 Be critical but fair:
 - Don't accept findings at face value - verify them
 - Don't reject findings just to disagree - have reasons

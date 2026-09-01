@@ -388,6 +388,94 @@ run_codex() {
 }
 
 # ============================================================================
+# Agent orchestration helpers
+# ============================================================================
+
+# Portable SHA-256 over stdin. macOS has shasum, most Linux has sha256sum,
+# Git Bash has both (shasum only via core_perl).
+sha256_hash() {
+    if command -v sha256sum &> /dev/null; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum &> /dev/null; then
+        shasum -a 256 | cut -d' ' -f1
+    else
+        cksum | cut -d' ' -f1
+    fi
+}
+
+describe_exit() {
+    if [[ "$1" -eq 124 ]]; then
+        echo "timed out after ${TIMEOUT_MINUTES}m"
+    else
+        echo "exit code $1"
+    fi
+}
+
+# Wait on a parallel Claude/Codex pair and surface failures.
+# Exit codes used to be discarded with `wait || true`, which made a crashed or
+# timed-out agent indistinguishable from a clean review: the artifact has no
+# status block, so it parses to 0 issues and the loop burns iterations on
+# garbage. Returns non-zero only when BOTH agents failed, which is unrecoverable
+# for the iteration; a single failure degrades to a warning.
+wait_for_agents() {
+    local claude_pid="$1"
+    local codex_pid="$2"
+    local phase="$3"
+    local claude_rc=0
+    local codex_rc=0
+
+    wait "$claude_pid" || claude_rc=$?
+    wait "$codex_pid" || codex_rc=$?
+
+    [[ $claude_rc -ne 0 ]] && log_error "Claude failed in $phase ($(describe_exit $claude_rc))"
+    [[ $codex_rc -ne 0 ]] && log_error "Codex failed in $phase ($(describe_exit $codex_rc))"
+
+    if [[ $claude_rc -ne 0 && $codex_rc -ne 0 ]]; then
+        log_error "Both agents failed in $phase - aborting iteration"
+        return 1
+    fi
+    return 0
+}
+
+# Fingerprint the ISSUES in a set of reviews, not their prose.
+# The old implementation hashed the raw review text, which never repeats
+# byte-for-byte across iterations because LLM wording varies. That silently
+# disabled the circuit breaker's same-issues trigger. Fingerprinting the set of
+# referenced source locations is stable across rewordings; line numbers are
+# stripped because they shift as fixes are applied.
+issues_fingerprint() {
+    cat "$@" 2>/dev/null \
+        | grep -oiE '[A-Za-z0-9_./-]+\.(py|ts|tsx|js|jsx|sh|go|rs|java|rb|c|h|cpp|hpp|cs|php|swift|kt)(:[0-9]+)?' \
+        | sed 's/:[0-9]*$//' \
+        | tr '[:upper:]' '[:lower:]' \
+        | sort -u \
+        | sha256_hash
+}
+
+# Hash of the target's working-tree state, used to detect whether phase 4
+# actually changed anything rather than trusting the agent's self-report.
+# Echoes "no-git" when the target is not a git repository.
+target_state_hash() {
+    local dir="$1"
+    if git -C "$dir" rev-parse --git-dir &> /dev/null; then
+        { git -C "$dir" status --porcelain; git -C "$dir" diff; git -C "$dir" diff --cached; } 2>/dev/null | sha256_hash
+    else
+        echo "no-git"
+    fi
+}
+
+# CONSENSUS_REACHED is coerced by parse_status_block: YES becomes boolean true,
+# PARTIAL and NO stay strings. Accept only unambiguous agreement.
+consensus_is_yes() {
+    local file="$1"
+    local block
+    block=$(parse_status_block "$file" "META_REVIEW_STATUS" 2>/dev/null || echo '{}')
+    local value
+    value=$(echo "$block" | jq -r '.consensus_reached // "NO"' 2>/dev/null || echo "NO")
+    [[ "$value" == "true" || "$value" == "YES" ]]
+}
+
+# ============================================================================
 # PHASE 1: Independent Reviews
 # ============================================================================
 run_phase_1() {
@@ -417,8 +505,9 @@ $source_code
     run_codex "$full_prompt" "$codex_out" "$target_dir" &
     local codex_pid=$!
 
-    wait $claude_pid || true
-    wait $codex_pid || true
+    if ! wait_for_agents "$claude_pid" "$codex_pid" "phase 1"; then
+        return 2  # Both agents dead - caller aborts the iteration
+    fi
 
     # Parse results
     local claude_status=$(parse_status_block "$claude_out" "REVIEW_STATUS")
@@ -449,7 +538,8 @@ $source_code
 # PHASE 2: Cross-Review
 # ============================================================================
 run_phase_2() {
-    local iteration="$1"
+    local target_dir="$1"
+    local iteration="$2"
 
     log_info "=== Phase 2: Cross-Review ==="
 
@@ -458,6 +548,11 @@ run_phase_2() {
 
     local cross_prompt=$(cat "$PROMPTS_DIR/cross_review.md")
 
+    # The source must be in context here. cross_review.md asks the agent to verify
+    # findings rather than accept them, and to add issues the other agent missed -
+    # neither is possible from the other agent's prose alone.
+    local source_code=$(collect_source_code "$target_dir")
+
     # Claude reviews Codex
     local claude_prompt="$cross_prompt
 
@@ -465,6 +560,11 @@ run_phase_2() {
 # THE OTHER AGENT'S REVIEW TO ANALYZE
 
 $(cat "$codex_review")
+
+---
+# SOURCE CODE (verify their findings against this)
+
+$source_code
 "
 
     # Codex reviews Claude
@@ -474,19 +574,27 @@ $(cat "$codex_review")
 # THE OTHER AGENT'S REVIEW TO ANALYZE
 
 $(cat "$claude_review")
+
+---
+# SOURCE CODE (verify their findings against this)
+
+$source_code
 "
 
     local claude_out="$ARTIFACTS_DIR/iter${iteration}_2_claude_on_codex.md"
     local codex_out="$ARTIFACTS_DIR/iter${iteration}_2_codex_on_claude.md"
 
-    run_claude "$claude_prompt" "$claude_out" &
+    # Pass target_dir explicitly: omitting it defaulted working_dir to $PWD, so
+    # cross-review ran against the adversarial-review repo instead of the target.
+    run_claude "$claude_prompt" "$claude_out" "$target_dir" &
     local claude_pid=$!
 
-    run_codex "$codex_prompt" "$codex_out" &
+    run_codex "$codex_prompt" "$codex_out" "$target_dir" &
     local codex_pid=$!
 
-    wait $claude_pid || true
-    wait $codex_pid || true
+    if ! wait_for_agents "$claude_pid" "$codex_pid" "phase 2"; then
+        return 2
+    fi
 
     local claude_status=$(parse_status_block "$claude_out" "CROSS_REVIEW_STATUS")
     local codex_status=$(parse_status_block "$codex_out" "CROSS_REVIEW_STATUS")
@@ -495,23 +603,36 @@ $(cat "$claude_review")
     add_to_history "$iteration" "phase_2" "codex" "$codex_status"
 
     log_success "Cross-review complete"
+    return 0
 }
 
 # ============================================================================
 # PHASE 3: Meta-Review
 # ============================================================================
 run_phase_3() {
-    local iteration="$1"
+    local target_dir="$1"
+    local iteration="$2"
 
     log_info "=== Phase 3: Meta-Review ==="
 
+    local claude_review="$ARTIFACTS_DIR/iter${iteration}_1_claude_review.md"
+    local codex_review="$ARTIFACTS_DIR/iter${iteration}_1_codex_review.md"
     local codex_on_claude="$ARTIFACTS_DIR/iter${iteration}_2_codex_on_claude.md"
     local claude_on_codex="$ARTIFACTS_DIR/iter${iteration}_2_claude_on_codex.md"
 
     local meta_prompt=$(cat "$PROMPTS_DIR/meta_review.md")
 
-    # Claude responds to Codex's feedback
+    # Each agent MUST be shown its own phase-1 review. Every agent call is a fresh
+    # stateless CLI invocation with no session continuity, so without this the
+    # prompt asks an agent to defend or concede positions it has never seen and
+    # can only infer from its critic's paraphrase. This is the step that produces
+    # CONSENSUS_REACHED, which drives the circuit breaker.
     local claude_prompt="$meta_prompt
+
+---
+# YOUR ORIGINAL REVIEW (the positions you are defending or conceding)
+
+$(cat "$claude_review")
 
 ---
 # FEEDBACK ON YOUR ORIGINAL REVIEW
@@ -519,8 +640,12 @@ run_phase_3() {
 $(cat "$codex_on_claude")
 "
 
-    # Codex responds to Claude's feedback
     local codex_prompt="$meta_prompt
+
+---
+# YOUR ORIGINAL REVIEW (the positions you are defending or conceding)
+
+$(cat "$codex_review")
 
 ---
 # FEEDBACK ON YOUR ORIGINAL REVIEW
@@ -531,14 +656,15 @@ $(cat "$claude_on_codex")
     local claude_out="$ARTIFACTS_DIR/iter${iteration}_3_claude_meta.md"
     local codex_out="$ARTIFACTS_DIR/iter${iteration}_3_codex_meta.md"
 
-    run_claude "$claude_prompt" "$claude_out" &
+    run_claude "$claude_prompt" "$claude_out" "$target_dir" &
     local claude_pid=$!
 
-    run_codex "$codex_prompt" "$codex_out" &
+    run_codex "$codex_prompt" "$codex_out" "$target_dir" &
     local codex_pid=$!
 
-    wait $claude_pid || true
-    wait $codex_pid || true
+    if ! wait_for_agents "$claude_pid" "$codex_pid" "phase 3"; then
+        return 2
+    fi
 
     local claude_status=$(parse_status_block "$claude_out" "META_REVIEW_STATUS")
     local codex_status=$(parse_status_block "$codex_out" "META_REVIEW_STATUS")
@@ -547,6 +673,7 @@ $(cat "$claude_on_codex")
     add_to_history "$iteration" "phase_3" "codex" "$codex_status"
 
     log_success "Meta-review complete"
+    return 0
 }
 
 # ============================================================================
@@ -596,24 +723,65 @@ Working directory: $target_dir
 
     local output_file="$ARTIFACTS_DIR/iter${iteration}_4_synthesis.md"
 
-    run_claude "$context" "$output_file" "$target_dir" "true"
+    # Snapshot the target before synthesis so progress can be measured against
+    # ground truth rather than the agent's self-report.
+    local state_before=$(target_state_hash "$target_dir")
+
+    local synth_rc=0
+    run_claude "$context" "$output_file" "$target_dir" "true" || synth_rc=$?
+    if [[ $synth_rc -ne 0 ]]; then
+        log_error "Synthesis agent failed ($(describe_exit $synth_rc)) - no fixes applied this iteration"
+    fi
+
+    local state_after=$(target_state_hash "$target_dir")
 
     local status=$(parse_status_block "$output_file" "SYNTHESIS_STATUS")
     local exit_signal=$(echo "$status" | jq -r '.exit_signal // false')
-    local files_modified=$(echo "$status" | jq -r '.files_modified // 0')
+    local reported_modified=$(echo "$status" | jq -r '.files_modified // 0')
+
+    # Progress = did the target's working tree actually change. FILES_MODIFIED is
+    # self-reported by the agent, and a missing status block parses to 0, which
+    # reads as "no progress" and advances the breaker on a parsing failure rather
+    # than a real stall. Fall back to the self-report only for non-git targets.
+    local fixes_made=0
+    if [[ "$state_before" == "no-git" ]]; then
+        log_warning "Target is not a git repository - falling back to self-reported FILES_MODIFIED"
+        fixes_made="$reported_modified"
+    else
+        if [[ "$state_before" != "$state_after" ]]; then
+            fixes_made=1
+            log_success "Target working tree changed (agent reported $reported_modified files)"
+        else
+            log_warning "Target working tree unchanged (agent reported $reported_modified files)"
+        fi
+    fi
 
     add_to_history "$iteration" "phase_4" "claude" "$status"
 
-    # Record for circuit breaker
+    # Consensus requires BOTH agents to say so. Reading only Claude's meta-review
+    # let the breaker record agreement while Codex was still reporting NO.
     local agents_agree=0
-    # Check if both agents found similar issues
-    local claude_meta=$(parse_status_block "$ARTIFACTS_DIR/iter${iteration}_3_claude_meta.md" "META_REVIEW_STATUS" 2>/dev/null || echo '{}')
-    local consensus=$(echo "$claude_meta" | jq -r '.consensus_reached // "NO"')
-    [[ "$consensus" == "YES" || "$consensus" == "true" ]] && agents_agree=1
+    if consensus_is_yes "$ARTIFACTS_DIR/iter${iteration}_3_claude_meta.md" \
+       && consensus_is_yes "$ARTIFACTS_DIR/iter${iteration}_3_codex_meta.md"; then
+        agents_agree=1
+    fi
 
-    local issues_hash=$(cat "$ARTIFACTS_DIR/iter${iteration}_1_claude_review.md" "$ARTIFACTS_DIR/iter${iteration}_1_codex_review.md" | shasum -a 256 | cut -d' ' -f1)
+    # Surface arbiter bias: Claude is both a debater and the judge here, so make
+    # any lopsided accept/reject split visible instead of silent.
+    local from_claude=$(echo "$status" | jq -r '.fixes_from_claude // 0')
+    local from_codex=$(echo "$status" | jq -r '.fixes_from_codex // 0')
+    local rej_claude=$(echo "$status" | jq -r '.rejected_from_claude // 0')
+    local rej_codex=$(echo "$status" | jq -r '.rejected_from_codex // 0')
+    log_info "Arbiter split - accepted: Claude=$from_claude Codex=$from_codex | rejected: Claude=$rej_claude Codex=$rej_codex"
+    if [[ "$rej_codex" -gt 0 && "$rej_codex" -gt $((rej_claude * 2 + 1)) ]]; then
+        log_warning "Synthesis rejected disproportionately many Codex findings - possible self-preference bias"
+    fi
 
-    record_iteration_result "$iteration" "$files_modified" "$agents_agree" "$issues_hash"
+    local issues_hash=$(issues_fingerprint \
+        "$ARTIFACTS_DIR/iter${iteration}_1_claude_review.md" \
+        "$ARTIFACTS_DIR/iter${iteration}_1_codex_review.md")
+
+    record_iteration_result "$iteration" "$fixes_made" "$agents_agree" "$issues_hash"
 
     if [[ "$exit_signal" == "true" ]]; then
         log_success "Synthesis complete - no more issues"
@@ -669,20 +837,38 @@ run_review_loop() {
         log_info "=========================================="
         echo ""
 
-        # Phase 1
-        if run_phase_1 "$target_dir" "$iteration"; then
+        # Phase 1. Return codes: 0 = both clean, 1 = issues found, 2 = both agents dead.
+        local phase_rc=0
+        run_phase_1 "$target_dir" "$iteration" || phase_rc=$?
+        if [[ $phase_rc -eq 0 ]]; then
             log_success "Review complete - both agents report clean code"
             update_tracking "status" "clean"
             return 0
+        elif [[ $phase_rc -eq 2 ]]; then
+            log_error "Halting: no usable agent output in phase 1"
+            update_tracking "status" "agent_failure"
+            return 1
         fi
         echo ""
 
         # Phase 2
-        run_phase_2 "$iteration"
+        phase_rc=0
+        run_phase_2 "$target_dir" "$iteration" || phase_rc=$?
+        if [[ $phase_rc -eq 2 ]]; then
+            log_error "Halting: no usable agent output in phase 2"
+            update_tracking "status" "agent_failure"
+            return 1
+        fi
         echo ""
 
         # Phase 3
-        run_phase_3 "$iteration"
+        phase_rc=0
+        run_phase_3 "$target_dir" "$iteration" || phase_rc=$?
+        if [[ $phase_rc -eq 2 ]]; then
+            log_error "Halting: no usable agent output in phase 3"
+            update_tracking "status" "agent_failure"
+            return 1
+        fi
         echo ""
 
         # Phase 4

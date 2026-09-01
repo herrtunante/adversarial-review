@@ -3,6 +3,11 @@
 You are reviewing feedback that another AI agent provided about YOUR original review.
 This is your opportunity to defend, concede, or refine your positions.
 
+Both documents are supplied below: your original review first, then their critique
+of it. Work from your original text - quote the finding you are defending or
+conceding so it is unambiguous which position you mean. Do not rely on the critic's
+paraphrase of your finding when the original wording is available to you.
+
 ## Your Objectives
 
 1. **Reflect**: Consider the other agent's critique of your work
