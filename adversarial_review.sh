@@ -46,6 +46,8 @@ MAX_ITERATIONS="${MAX_ITERATIONS:-3}"
 VERBOSE="${VERBOSE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 TIMEOUT_MINUTES="${TIMEOUT_MINUTES:-10}"
+NO_FIX="${NO_FIX:-0}"
+CHANGED_ONLY="${CHANGED_ONLY:-0}"
 
 # Colors
 RED='\033[0;31m'
@@ -243,6 +245,66 @@ parse_status_block() {
     echo "$json"
 }
 
+# Collect only the files with uncommitted changes (--changed-only).
+#
+# `git status --porcelain` emits paths relative to the REPOSITORY ROOT, which is
+# not necessarily the target directory - a target can sit several levels below
+# its repo root. Resolve every path against the root, then keep only the files
+# that actually live under the target. Files are included whole rather than
+# head-truncated: a changed set is small, and truncating a diff under review
+# defeats the point.
+collect_changed_files() {
+    local target_dir="$1"
+    local max_lines="${2:-3000}"
+    local output=""
+    local repo_root
+    local abs_target
+
+    if ! repo_root=$(git -C "$target_dir" rev-parse --show-toplevel 2>/dev/null); then
+        log_error "--changed-only requires the target to be inside a git repository"
+        return 1
+    fi
+
+    abs_target="$(cd "$target_dir" && pwd)"
+    log_verbose "Collecting changed files (repo root: $repo_root)"
+
+    local rel path canon
+    while IFS= read -r rel; do
+        [[ -z "$rel" ]] && continue
+        rel="${rel##* -> }"          # renames arrive as "old -> new"
+        rel="${rel#\"}"; rel="${rel%\"}"
+        path="$repo_root/$rel"
+        [[ -f "$path" ]] || continue
+
+        case "${rel##*.}" in
+            png|jpg|jpeg|gif|ico|icns|ttf|woff|woff2|xlsx|xls|zip|jar|class|exe|dll|pdf|so|dylib)
+                log_verbose "Skipping binary: $rel"
+                continue
+                ;;
+        esac
+
+        # Normalise to the shell's path form before comparing; git may report a
+        # Windows-style root while $PWD is POSIX-style.
+        canon="$(cd "$(dirname "$path")" 2>/dev/null && pwd)" || continue
+        case "$canon/" in
+            "$abs_target"/*) ;;
+            *) log_verbose "Skipping (outside target): $rel"; continue ;;
+        esac
+
+        log_verbose "Including changed file: $rel"
+        output+="
+=== FILE: $rel ===
+$(head -$max_lines "$path" 2>/dev/null)
+"
+    done < <(git -C "$target_dir" status --porcelain | sed 's/^...//')
+
+    if [[ -z "$output" ]]; then
+        log_warning "No changed files found under $target_dir"
+    fi
+
+    echo "$output"
+}
+
 # Collect source code from target directory
 collect_source_code() {
     local target_dir="$1"
@@ -251,7 +313,24 @@ collect_source_code() {
     local output=""
     local count=0
 
+    if [[ "$CHANGED_ONLY" == "1" ]]; then
+        collect_changed_files "$target_dir"
+        return 0
+    fi
+
     log_verbose "Collecting source code from $target_dir"
+
+    # Java
+    count=0
+    while IFS= read -r file && [[ $count -lt $max_files ]]; do
+        [[ -z "$file" ]] && continue
+        local rel="${file#$target_dir/}"
+        output+="
+=== FILE: $rel ===
+$(head -$max_lines "$file" 2>/dev/null)
+"
+        ((count++))
+    done < <(find "$target_dir" -name "*.java" -type f ! -path "*/\.*" ! -path "*/target/*" ! -path "*/build/*" 2>/dev/null | sort)
 
     # Python files
     count=0
@@ -359,7 +438,20 @@ run_codex() {
     # parsed result. -o writes only the agent's final message.
     local codex_bin="${CODEX_BIN:-codex}"
     local codex_log="$LOGS_DIR/$(basename "${output_file%.md}").codex.log"
-    local codex_args=(exec --sandbox read-only --skip-git-repo-check -o "$output_file" -)
+
+    # NEVER pass a path containing spaces to codex. On Windows the npm codex.cmd
+    # shim re-expands %* and loses the quoting, so cmd.exe tries to execute the
+    # first fragment and dies with "'C:\Users\Alfonso' is not recognized...".
+    # Artifact paths contain spaces on any normal Windows user account, so hand
+    # codex a space-free temp path for -o and move the result into place with
+    # bash, which quotes correctly. The prompt goes on stdin, so it is unaffected.
+    local codex_tmp
+    codex_tmp="$(mktemp -t ar_codex_XXXXXX 2>/dev/null || echo "/tmp/ar_codex_$$_$RANDOM")"
+    case "$codex_tmp" in
+        *" "*) log_warning "Temp path contains spaces - codex may fail: $codex_tmp" ;;
+    esac
+
+    local codex_args=(exec --sandbox read-only --skip-git-repo-check -o "$codex_tmp" -)
 
     mkdir -p "$LOGS_DIR"
 
@@ -370,10 +462,16 @@ run_codex() {
         (cd "$working_dir" && printf '%s' "$prompt" | "$codex_bin" "${codex_args[@]}") > "$codex_log" 2>&1 || exit_code=$?
     fi
 
+    if [[ -s "$codex_tmp" ]]; then
+        mv "$codex_tmp" "$output_file"
+    fi
+    rm -f "$codex_tmp"
+
     # Fall back to the transcript if codex died before writing the final message
     if [[ ! -s "$output_file" ]]; then
         log_warning "Codex produced no final message; falling back to transcript"
         cp "$codex_log" "$output_file" 2>/dev/null || echo "Codex produced no output" > "$output_file"
+        [[ $exit_code -eq 0 ]] && exit_code=1
     fi
 
     if [[ $exit_code -eq 0 ]]; then
@@ -687,6 +785,30 @@ run_phase_4() {
 
     local synthesis_prompt=$(cat "$PROMPTS_DIR/synthesis.md")
 
+    # Report-only mode. The override goes FIRST so it is read before the
+    # implementation instructions it countermands, and the agent is additionally
+    # denied write permissions below.
+    if [[ "$NO_FIX" == "1" ]]; then
+        synthesis_prompt="# REPORT-ONLY MODE - THIS OVERRIDES EVERY INSTRUCTION BELOW
+
+Do NOT modify, create, or delete any file. Do not use Edit, Write, or any
+shell command that writes. You are producing a written report only; the user
+will decide what to act on.
+
+Everything below describes how to weigh and prioritise the findings. Follow all
+of it EXCEPT the instruction to implement fixes. Where it says to implement a
+fix, instead describe the change you would make and show the concrete diff or
+replacement code inline in your report.
+
+In the status block, report FILES_MODIFIED: 0 and count the fixes you are
+RECOMMENDING under HIGH_CONFIDENCE_FIXES / MEDIUM_CONFIDENCE_FIXES. Set
+EXIT_SIGNAL: true - there is no follow-up iteration in report-only mode.
+
+---
+
+$synthesis_prompt"
+    fi
+
     # Gather all artifacts
     local context="$synthesis_prompt
 
@@ -727,8 +849,13 @@ Working directory: $target_dir
     # ground truth rather than the agent's self-report.
     local state_before=$(target_state_hash "$target_dir")
 
+    # Report-only mode also withholds --dangerously-skip-permissions, so the
+    # prompt override is backed by an actual permission boundary.
+    local allow_writes="true"
+    [[ "$NO_FIX" == "1" ]] && allow_writes="false"
+
     local synth_rc=0
-    run_claude "$context" "$output_file" "$target_dir" "true" || synth_rc=$?
+    run_claude "$context" "$output_file" "$target_dir" "$allow_writes" || synth_rc=$?
     if [[ $synth_rc -ne 0 ]]; then
         log_error "Synthesis agent failed ($(describe_exit $synth_rc)) - no fixes applied this iteration"
     fi
@@ -757,6 +884,19 @@ Working directory: $target_dir
     fi
 
     add_to_history "$iteration" "phase_4" "claude" "$status"
+
+    # Report-only mode stops here. Nothing was changed, so a further iteration
+    # would re-review byte-identical code, and feeding a guaranteed zero-progress
+    # result to the circuit breaker would leave it dirty for the next real run.
+    if [[ "$NO_FIX" == "1" ]]; then
+        if [[ "$state_before" != "$state_after" ]]; then
+            log_error "Report-only mode but the target changed - inspect 'git status' in the target"
+        else
+            log_success "Report-only: target untouched"
+        fi
+        log_success "Report written to $output_file"
+        return 0
+    fi
 
     # Consensus requires BOTH agents to say so. Reading only Claude's meta-review
     # let the breaker record agreement while Codex was still reporting NO.
@@ -795,9 +935,58 @@ Working directory: $target_dir
 # ============================================================================
 # Main Review Loop
 # ============================================================================
+# Two concurrent runs share artifacts/, tracking.json and the circuit breaker.
+# They silently overwrite each other's artifacts mid-phase, so a later phase can
+# read a file that a different run has since replaced. Refuse to start a second
+# run rather than produce a debate spliced from two of them.
+# LOCK_FILE must be global: the EXIT trap fires after acquire_lock has returned,
+# so a `local` would be out of scope and `set -u` would abort the trap with
+# "lock_file: unbound variable", leaving the lock behind.
+LOCK_FILE="$AR_DIR/.review.lock"
+
+acquire_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        local holder
+        holder=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+            log_error "A review is already running (pid $holder)"
+            log_error "Concurrent runs corrupt each other's artifacts. Wait for it to"
+            log_error "finish, or kill it and remove $LOCK_FILE"
+            exit 1
+        fi
+        log_warning "Removing stale lock left by pid ${holder:-unknown}"
+        rm -f "$LOCK_FILE"
+    fi
+
+    echo $$ > "$LOCK_FILE"
+    trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
+}
+
+# A --dry-run writes stub artifacts to the same paths as a real run, so starting
+# one over a completed review destroys the report. Artifacts are the only copy:
+# run_claude streams straight to the artifact file and keeps no transcript.
+guard_existing_artifacts() {
+    [[ "$DRY_RUN" == "1" ]] || return 0
+    [[ -d "$ARTIFACTS_DIR" ]] || return 0
+
+    local real_count
+    real_count=$(grep -LFx "DRY RUN: Claude output" "$ARTIFACTS_DIR"/*.md 2>/dev/null \
+                 | xargs -r -I{} grep -LFx "DRY RUN: Codex output" {} 2>/dev/null | grep -c . || true)
+
+    if [[ "${real_count:-0}" -gt 0 ]]; then
+        log_error "Refusing to dry-run over $real_count real artifact(s) in $ARTIFACTS_DIR"
+        log_error "A dry run overwrites them with stubs and they are the only copy."
+        log_error "Save them elsewhere, then run --reset first."
+        exit 1
+    fi
+}
+
 run_review_loop() {
     local target_dir="$1"
     target_dir="$(cd "$target_dir" && pwd)"
+
+    guard_existing_artifacts
+    acquire_lock
 
     log_info "Starting Adversarial Review Loop"
     log_info "Target: $target_dir"
@@ -873,8 +1062,13 @@ run_review_loop() {
 
         # Phase 4
         if run_phase_4 "$target_dir" "$iteration"; then
-            log_success "Synthesis complete"
-            update_tracking "status" "clean"
+            if [[ "$NO_FIX" == "1" ]]; then
+                log_success "Report complete - no files were modified"
+                update_tracking "status" "report_only"
+            else
+                log_success "Synthesis complete"
+                update_tracking "status" "clean"
+            fi
             return 0
         fi
         echo ""
@@ -928,7 +1122,7 @@ reset_all() {
     log_info "Resetting all state..."
     rm -rf "$ARTIFACTS_DIR"/* "$TRACKING_FILE"
     rm -f "$AR_DIR/.circuit_breaker.json" "$AR_DIR/.circuit_breaker_history.json"
-    rm -f "$AR_DIR/.response_analysis.json"
+    rm -f "$AR_DIR/.response_analysis.json" "$AR_DIR/.review.lock"
     mkdir -p "$ARTIFACTS_DIR" "$LOGS_DIR"
     init_tracking
     init_circuit_breaker
@@ -953,6 +1147,10 @@ OPTIONS:
     --reset-circuit         Reset circuit breaker only
     --circuit-status        Show circuit breaker status
     --dry-run               Show what would happen without executing
+    --no-fix                Review only: phase 4 writes a report and modifies
+                            nothing. Runs a single iteration.
+    --changed-only          Review only files with uncommitted git changes,
+                            included in full rather than truncated.
 
 PHASES:
     1. Independent Review   Claude and Codex review code in parallel
@@ -1030,6 +1228,14 @@ main() {
                 ;;
             --dry-run)
                 DRY_RUN=1
+                shift
+                ;;
+            --no-fix)
+                NO_FIX=1
+                shift
+                ;;
+            --changed-only)
+                CHANGED_ONLY=1
                 shift
                 ;;
             -*)
