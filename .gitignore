@@ -10,6 +10,9 @@ artifacts/
 # Logs
 logs/
 
+# Review output salvaged from a run (about a target project, not this tool)
+recovered/
+
 # macOS
 .DS_Store
 
