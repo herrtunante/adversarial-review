@@ -38,8 +38,23 @@ run there (`bash -n` clean, `--help` works) despite `core.autocrlf=true` giving 
 CRLF endings. `shasum` resolves via `/usr/bin/core_perl/shasum`; on Linux it is often absent, where
 `sha256sum` is the portable substitute. `claude` and `timeout` both work from bash.
 
-**One remaining prerequisite: `jq` is not installed.** `check_dependencies` hard-exits without it.
-`choco install jq` or `winget install jqlang.jq`.
+`jq` is installed (jq 1.8.2 via winget) and `check_dependencies` hard-exits without it; on a fresh
+machine use `winget install jqlang.jq` or `choco install jq`.
+
+**Bash PIDs are not Windows PIDs.** Git Bash has its own process namespace, so the pid in
+`.review.lock` is only meaningful to `ps`/`kill -0` inside bash. PowerShell's `Get-Process` will
+report it as gone while the process is alive. Win32 `CommandLine` is also empty for Git Bash
+children, so searching Windows process lists for `adversarial_review` finds nothing. Git Bash's own
+`ps -ef` is no better for this: it prints every script as a bare `/usr/bin/bash`, so
+`ps -ef | grep run_chunked` never matches. Read the command lines from `/proc` instead:
+
+```bash
+for p in /proc/[0-9]*; do c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+  case "$c" in *run_chunked_review*|*adversarial_review.sh*) echo "${p#/proc/}: $c";; esac; done
+```
+
+A running review shows several `adversarial_review.sh` lines; the extras are the subshells that
+run each phase's two agents in parallel, not separate reviews.
 
 Two Windows-specific problems have been fixed in the script; don't reintroduce them:
 
@@ -157,10 +172,106 @@ from a clean review — the loop would burn every remaining iteration on empty i
 ### Source collection is the main scope limit
 
 `collect_source_code()` builds one flat text dump and is the only thing the agents see in phase 1
-— they do get the target as cwd, but the prompt itself is this dump. It is capped at **30 Python
-files, 30 TS/JS files, and 10 shell scripts, truncated to the first 500 lines each (300 for
-shell)**. Any other language (Go, Rust, Java, C…) is invisible to the review. Widening language
-coverage or the caps happens here, and directly drives prompt size and cost.
+— they do get the target as cwd, but the prompt itself is this dump. It walks **Java, Python and
+TS/JS at `MAX_SOURCE_FILES` each (default 30) and shell at `MAX_SOURCE_SHELL_FILES` (default 10)**,
+truncating to `MAX_SOURCE_LINES` / `MAX_SOURCE_SHELL_LINES` (500 / 300). Any other language (Go,
+Rust, C…) is still invisible. Widening coverage or the caps happens here and directly drives prompt
+size and cost.
+
+`MAX_SOURCE_EXCLUDE` is an extended regex matched against each **absolute** path; matches are
+dropped *before* the cap applies, so vendored or generated trees don't consume the file budget.
+This is the only scoping lever the collector has — it can subtract but never restrict to a subtree,
+which is why `run_chunked_review.sh` has to enumerate the complement of what it wants to keep.
+
+Two caps-related gotchas:
+
+- The find for TS/JS excludes `node_modules` but **not** `target/`, `dist/` or `build/`. On a Maven
+  webapp the alphabetically-first matches are all vendored copies under `*/target/`, so without an
+  exclude the entire JS budget is spent on build output. The Java find does exclude `target/`.
+- The list is `sort`ed by path, so an over-budget tree is not sampled, it is truncated from the
+  front. On a 1,600-file project the default caps show the agents the same alphabetically-first 30
+  files every run.
+
+### Reviewing a project too large for one dump
+
+`run_chunked_review.sh` drives `adversarial_review.sh` over a big multi-module target one chunk at
+a time, and `aggregate_review.sh` merges the per-chunk synthesis reports into one document.
+
+```bash
+./run_chunked_review.sh --target ../collect --list chunks/collect.manifest      # plan + sizes only
+./run_chunked_review.sh --target ../collect -t 15 -o reviews/run1 chunks/collect.manifest
+./run_chunked_review.sh --target ../collect --resume -o reviews/run1 chunks/collect.manifest
+./aggregate_review.sh reviews/run1                                             # -> REPORT.md
+```
+
+A manifest line is `chunk_id | module_root | include_path[,include_path...]`. The module root
+becomes the agents' cwd, so they keep that module's build file in view; the include paths are
+everything the dump is allowed to contain.
+
+Things the driver has to do because state in this repo is global, not per-run:
+
+- `artifacts/` is named `iter{N}_...` with no chunk in the name, so chunk N+1 overwrites chunk N.
+  The driver copies `artifacts/`, `logs/` and `tracking.json` into `<out>/<chunk_id>/` after each
+  chunk, then empties `artifacts/` and the `iter*` logs itself before the next.
+- **It must never call `--reset` between chunks.** `reset_all()` deletes `.review.lock`, which is
+  the only thing stopping a second review from interleaving in `artifacts/`. Calling it per chunk
+  once let two drivers run at the same time: one chunk's report was built from another package's
+  prompt and still carried a valid status block. `reset_all()` now refuses while a live pid holds
+  the lock, and the driver aborts if it finds one.
+- The circuit breaker persists across invocations and OPEN is terminal, so the driver calls
+  `--reset-circuit` per chunk. Without it one stalled chunk blocks every later one.
+- Chunks default to `--no-fix`. Twenty unattended synthesis passes writing into a shared target is
+  not something to start by accident; `--fix` opts in.
+
+A chunk is only archived as done if it survives three checks, and `--resume` redoes any chunk
+whose phase-4 report lacks a real `SYNTHESIS_STATUS` block (a `tracking.json` alone proves
+nothing):
+
+- **Transient failure.** A quota refusal or a dropped network does not stop a phase. The agent
+  writes a one-line error in place of the review, which parses to zero issues and looks exactly
+  like clean code. `artifact_is_transient_failure` recognises two shapes: a short file (under 2 KB)
+  holding a quota or connection error, or a Codex transcript (copied in by `run_codex`'s fallback)
+  with timestamped transport `ERROR` lines. The broad phrases are only trusted in short files; in
+  a full review they match findings about rate limiting. On a hit the driver waits for
+  `claude --print` to answer a probe (every 5 minutes, up to 2 hours) and redoes the chunk.
+- **Scope contamination.** The Codex transcript echoes the prompt, so its `=== FILE:` markers are a
+  record of what the agent was really shown. Any path the chunk's exclude regex would have dropped
+  means the artifacts came from another run.
+- **Salvage.** If only synthesis failed, the six debate artifacts are kept and the retry runs
+  `adversarial_review.sh --from-phase 4`, costing one agent call instead of seven.
+  `verify_resume_artifacts` refuses to start mid-run if any earlier artifact is missing or under
+  200 bytes.
+
+Long runs outlive the harness: a background task can be killed for "low memory" while the review
+underneath keeps going. Start the driver with `nohup ... &` writing to a log, and check `/proc` for
+a live driver (see the Windows notes above) before starting another. `.review.lock` alone does not
+prove the coast is clear: it is held by `adversarial_review.sh`, so it is absent in the gap between
+two chunks while the driver is still alive.
+
+For an unattended run, start `supervise_review.sh` instead of the driver. The driver gives up after
+two hours without a working agent CLI, which an overnight quota reset or a sleeping laptop easily
+exceeds. The supervisor restarts it with `--resume` until every chunk has a real synthesis report,
+and waits for any driver already running rather than starting a second. A saved debate sits beside
+the chunk directory as `<out>/.salvage-<chunk>/`, so it survives those restarts. To change the
+driver while a run is live, stage the new version as `run_chunked_review.next.sh`; the supervisor
+installs it only in the gap between driver runs, because bash reads a script as it executes and an
+in-place edit can corrupt the running copy.
+
+```bash
+nohup ./supervise_review.sh --target ../collect -o reviews/run1 chunks/collect.manifest >/dev/null 2>&1 &
+```
+
+To review two targets at once, run the second from a separate `git worktree`. All state lives in
+the script's own directory, so a second checkout gets its own `artifacts/`, lock and breaker. Both
+runs still draw on the same Claude session quota.
+
+Sizing: aim for 150–350 KB of source per chunk. Phase 2 sends the dump *plus* the other agent's
+review, so the real prompt is larger than the chunk. Cost is ~7 agent calls per chunk per
+iteration.
+
+An include path also pulls in the loose source files sitting in each of its ancestor directories.
+Splitting a package whose root holds most of the code therefore duplicates that code across both
+halves rather than dividing it.
 
 ## Known Traps
 

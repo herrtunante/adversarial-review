@@ -47,7 +47,22 @@ VERBOSE="${VERBOSE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 TIMEOUT_MINUTES="${TIMEOUT_MINUTES:-10}"
 NO_FIX="${NO_FIX:-0}"
+# Start the first iteration at this phase instead of phase 1, reusing the
+# artifacts already in artifacts/. Only phase 4 is expensive to lose, so this
+# exists to recover a run whose debate succeeded and whose synthesis was refused.
+FROM_PHASE="${FROM_PHASE:-1}"
 CHANGED_ONLY="${CHANGED_ONLY:-0}"
+
+# Source collection caps. These drive prompt size and therefore cost directly:
+# the phase-1 dump is sent to both agents, and phase 2 sends it again alongside
+# the other agent's review. MAX_SOURCE_EXCLUDE is an extended-regex matched
+# against each absolute path; anything matching is dropped before the cap is
+# applied, so vendored or generated trees don't consume the file budget.
+MAX_SOURCE_FILES="${MAX_SOURCE_FILES:-30}"
+MAX_SOURCE_LINES="${MAX_SOURCE_LINES:-500}"
+MAX_SOURCE_SHELL_FILES="${MAX_SOURCE_SHELL_FILES:-10}"
+MAX_SOURCE_SHELL_LINES="${MAX_SOURCE_SHELL_LINES:-300}"
+MAX_SOURCE_EXCLUDE="${MAX_SOURCE_EXCLUDE:-}"
 
 # Colors
 RED='\033[0;31m'
@@ -65,7 +80,12 @@ log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 log_claude()  { echo -e "${MAGENTA}[CLAUDE]${NC} $1"; }
 log_codex()   { echo -e "${CYAN}[CODEX]${NC} $1"; }
-log_verbose() { [[ "$VERBOSE" == "1" ]] && echo -e "${BLUE}[VERBOSE]${NC} $1" || true; }
+# Verbose output goes to stderr, not stdout. collect_source_code() and
+# collect_changed_files() are consumed with $(...), so anything they echo on
+# stdout is spliced into the source dump and shipped to the agents as if it were
+# code. With VERBOSE=1 the dump used to open with a stray "[VERBOSE] Collecting
+# source code from ..." line inside the prompt.
+log_verbose() { [[ "$VERBOSE" == "1" ]] && echo -e "${BLUE}[VERBOSE]${NC} $1" >&2 || true; }
 
 # Cross-platform timeout command
 get_timeout_cmd() {
@@ -305,11 +325,21 @@ $(head -$max_lines "$path" 2>/dev/null)
     echo "$output"
 }
 
+# Drop paths matching MAX_SOURCE_EXCLUDE. A no-op filter when it is unset, so
+# the find pipelines below can pipe through it unconditionally.
+filter_excluded() {
+    if [[ -z "$MAX_SOURCE_EXCLUDE" ]]; then
+        cat
+    else
+        grep -Ev "$MAX_SOURCE_EXCLUDE" || true
+    fi
+}
+
 # Collect source code from target directory
 collect_source_code() {
     local target_dir="$1"
-    local max_files="${2:-30}"
-    local max_lines="${3:-500}"
+    local max_files="${2:-$MAX_SOURCE_FILES}"
+    local max_lines="${3:-$MAX_SOURCE_LINES}"
     local output=""
     local count=0
 
@@ -330,7 +360,7 @@ collect_source_code() {
 $(head -$max_lines "$file" 2>/dev/null)
 "
         ((count++))
-    done < <(find "$target_dir" -name "*.java" -type f ! -path "*/\.*" ! -path "*/target/*" ! -path "*/build/*" 2>/dev/null | sort)
+    done < <(find "$target_dir" -name "*.java" -type f ! -path "*/\.*" ! -path "*/target/*" ! -path "*/build/*" 2>/dev/null | filter_excluded | sort)
 
     # Python files
     count=0
@@ -342,7 +372,7 @@ $(head -$max_lines "$file" 2>/dev/null)
 $(head -$max_lines "$file" 2>/dev/null)
 "
         ((count++))
-    done < <(find "$target_dir" -name "*.py" -type f ! -path "*/\.*" ! -path "*/__pycache__/*" ! -path "*/venv/*" ! -path "*/.venv/*" 2>/dev/null | sort)
+    done < <(find "$target_dir" -name "*.py" -type f ! -path "*/\.*" ! -path "*/__pycache__/*" ! -path "*/venv/*" ! -path "*/.venv/*" 2>/dev/null | filter_excluded | sort)
 
     # TypeScript/JavaScript
     count=0
@@ -354,19 +384,19 @@ $(head -$max_lines "$file" 2>/dev/null)
 $(head -$max_lines "$file" 2>/dev/null)
 "
         ((count++))
-    done < <(find "$target_dir" \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -type f ! -path "*/node_modules/*" ! -path "*/\.*" 2>/dev/null | sort)
+    done < <(find "$target_dir" \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -type f ! -path "*/node_modules/*" ! -path "*/\.*" 2>/dev/null | filter_excluded | sort)
 
     # Shell scripts
     count=0
-    while IFS= read -r file && [[ $count -lt 10 ]]; do
+    while IFS= read -r file && [[ $count -lt $MAX_SOURCE_SHELL_FILES ]]; do
         [[ -z "$file" ]] && continue
         local rel="${file#$target_dir/}"
         output+="
 === FILE: $rel ===
-$(head -300 "$file" 2>/dev/null)
+$(head -$MAX_SOURCE_SHELL_LINES "$file" 2>/dev/null)
 "
         ((count++))
-    done < <(find "$target_dir" -name "*.sh" -type f ! -path "*/\.*" 2>/dev/null | sort)
+    done < <(find "$target_dir" -name "*.sh" -type f ! -path "*/\.*" 2>/dev/null | filter_excluded | sort)
 
     echo "$output"
 }
@@ -981,12 +1011,46 @@ guard_existing_artifacts() {
     fi
 }
 
+# Phases talk to each other only through artifact files, so starting mid-run is
+# safe exactly when the earlier phases' artifacts are present and real. Check
+# that here rather than letting a phase read a missing file and review nothing.
+verify_resume_artifacts() {
+    local from="$1"
+    local missing=()
+    local required=()
+
+    [[ $from -ge 2 ]] && required+=("iter1_1_claude_review.md" "iter1_1_codex_review.md")
+    [[ $from -ge 3 ]] && required+=("iter1_2_claude_on_codex.md" "iter1_2_codex_on_claude.md")
+    [[ $from -ge 4 ]] && required+=("iter1_3_claude_meta.md" "iter1_3_codex_meta.md")
+
+    local f
+    for f in "${required[@]}"; do
+        # 200 bytes is well under any real review and well over a one-line
+        # refusal such as "You have hit your session limit".
+        if [[ ! -s "$ARTIFACTS_DIR/$f" ]] || [[ $(wc -c < "$ARTIFACTS_DIR/$f") -lt 200 ]]; then
+            missing+=("$f")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "--from-phase $from needs earlier artifacts that are missing or empty:"
+        for f in "${missing[@]}"; do log_error "  $ARTIFACTS_DIR/$f"; done
+        return 1
+    fi
+    log_info "Resuming at phase $from using ${#required[@]} existing artifact(s)"
+    return 0
+}
+
 run_review_loop() {
     local target_dir="$1"
     target_dir="$(cd "$target_dir" && pwd)"
 
     guard_existing_artifacts
     acquire_lock
+
+    if [[ "$FROM_PHASE" -gt 1 ]]; then
+        verify_resume_artifacts "$FROM_PHASE" || return 1
+    fi
 
     log_info "Starting Adversarial Review Loop"
     log_info "Target: $target_dir"
@@ -1026,39 +1090,56 @@ run_review_loop() {
         log_info "=========================================="
         echo ""
 
+        # Only the first iteration may start part-way through; a second pass is
+        # reviewing changed code and has to redo the whole debate.
+        local start_phase=1
+        [[ $iteration -eq 1 ]] && start_phase=$FROM_PHASE
+
         # Phase 1. Return codes: 0 = both clean, 1 = issues found, 2 = both agents dead.
         local phase_rc=0
-        run_phase_1 "$target_dir" "$iteration" || phase_rc=$?
-        if [[ $phase_rc -eq 0 ]]; then
-            log_success "Review complete - both agents report clean code"
-            update_tracking "status" "clean"
-            return 0
-        elif [[ $phase_rc -eq 2 ]]; then
-            log_error "Halting: no usable agent output in phase 1"
-            update_tracking "status" "agent_failure"
-            return 1
+        if [[ $start_phase -le 1 ]]; then
+            run_phase_1 "$target_dir" "$iteration" || phase_rc=$?
+            if [[ $phase_rc -eq 0 ]]; then
+                log_success "Review complete - both agents report clean code"
+                update_tracking "status" "clean"
+                return 0
+            elif [[ $phase_rc -eq 2 ]]; then
+                log_error "Halting: no usable agent output in phase 1"
+                update_tracking "status" "agent_failure"
+                return 1
+            fi
+            echo ""
+        else
+            log_info "Skipping phase 1 (resuming at phase $start_phase)"
         fi
-        echo ""
 
         # Phase 2
-        phase_rc=0
-        run_phase_2 "$target_dir" "$iteration" || phase_rc=$?
-        if [[ $phase_rc -eq 2 ]]; then
-            log_error "Halting: no usable agent output in phase 2"
-            update_tracking "status" "agent_failure"
-            return 1
+        if [[ $start_phase -le 2 ]]; then
+            phase_rc=0
+            run_phase_2 "$target_dir" "$iteration" || phase_rc=$?
+            if [[ $phase_rc -eq 2 ]]; then
+                log_error "Halting: no usable agent output in phase 2"
+                update_tracking "status" "agent_failure"
+                return 1
+            fi
+            echo ""
+        else
+            log_info "Skipping phase 2 (resuming at phase $start_phase)"
         fi
-        echo ""
 
         # Phase 3
-        phase_rc=0
-        run_phase_3 "$target_dir" "$iteration" || phase_rc=$?
-        if [[ $phase_rc -eq 2 ]]; then
-            log_error "Halting: no usable agent output in phase 3"
-            update_tracking "status" "agent_failure"
-            return 1
+        if [[ $start_phase -le 3 ]]; then
+            phase_rc=0
+            run_phase_3 "$target_dir" "$iteration" || phase_rc=$?
+            if [[ $phase_rc -eq 2 ]]; then
+                log_error "Halting: no usable agent output in phase 3"
+                update_tracking "status" "agent_failure"
+                return 1
+            fi
+            echo ""
+        else
+            log_info "Skipping phase 3 (resuming at phase $start_phase)"
         fi
-        echo ""
 
         # Phase 4
         if run_phase_4 "$target_dir" "$iteration"; then
@@ -1119,6 +1200,21 @@ show_status() {
 }
 
 reset_all() {
+    # Never reset out from under a live review. The lock is what stops two runs
+    # from interleaving in the shared artifacts/ directory, so deleting it while
+    # its owner is still working re-opens exactly the corruption acquire_lock
+    # exists to prevent - and the victim silently reads artifacts written by the
+    # other run.
+    if [[ -f "$LOCK_FILE" ]]; then
+        local holder
+        holder=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+            log_error "A review is running (pid $holder) - refusing to reset its state"
+            log_error "Wait for it to finish, or kill it first"
+            exit 1
+        fi
+    fi
+
     log_info "Resetting all state..."
     rm -rf "$ARTIFACTS_DIR"/* "$TRACKING_FILE"
     rm -f "$AR_DIR/.circuit_breaker.json" "$AR_DIR/.circuit_breaker_history.json"
@@ -1149,6 +1245,9 @@ OPTIONS:
     --dry-run               Show what would happen without executing
     --no-fix                Review only: phase 4 writes a report and modifies
                             nothing. Runs a single iteration.
+    --from-phase N          Start the first iteration at phase N (1-4), reusing
+                            the artifacts already in artifacts/. Use it to redo
+                            only a failed synthesis without repeating the debate.
     --changed-only          Review only files with uncommitted git changes,
                             included in full rather than truncated.
 
@@ -1233,6 +1332,14 @@ main() {
             --no-fix)
                 NO_FIX=1
                 shift
+                ;;
+            --from-phase)
+                FROM_PHASE="$2"
+                if ! [[ "$FROM_PHASE" =~ ^[1-4]$ ]]; then
+                    log_error "--from-phase takes 1, 2, 3 or 4"
+                    exit 1
+                fi
+                shift 2
                 ;;
             --changed-only)
                 CHANGED_ONLY=1

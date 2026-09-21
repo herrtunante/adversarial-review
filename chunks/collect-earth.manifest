@@ -1,0 +1,18 @@
+# Chunk plan for Collect Earth (~320 main-source Java files, ~2.1 MB).
+#
+# Format:  chunk_id | module_root | include_path[,include_path...]
+#   module_root  is relative to --target and becomes the agents' working dir.
+#   include_path is relative to module_root; empty means the whole module.
+#
+# collect-earth-app/src/main/java/org/openforis/collect/earth/app/view is kept
+# whole (~385 KB): its loose files sit in the package root, so splitting off
+# view/properties would duplicate them into both halves.
+
+core            | collect-earth-core    | src/main
+sampler         | collect-earth-sampler | src/main
+grid            | collect-earth-grid    | src/main
+app-service     | collect-earth-app     | src/main/java/org/openforis/collect/earth/app/service
+app-view        | collect-earth-app     | src/main/java/org/openforis/collect/earth/app/view
+app-misc        | collect-earth-app     | src/main/java/org/openforis/collect/earth/app/ad_hoc,src/main/java/org/openforis/collect/earth/app/desktop,src/main/java/org/openforis/collect/earth/app/server,src/main/java/org/openforis/collect/earth/app/logging,src/main/java/org/openforis/collect/earth/app/model,src/main/java/org/openforis/collect/model/proxy
+ipcc-serialize  | collect-earth-app     | src/main/java/org/openforis/collect/earth/ipcc/serialize
+ipcc-model      | collect-earth-app     | src/main/java/org/openforis/collect/earth/ipcc/model,src/main/java/org/openforis/collect/earth/ipcc/view,src/main/java/org/openforis/collect/earth/ipcc/controller

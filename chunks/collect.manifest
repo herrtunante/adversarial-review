@@ -1,0 +1,54 @@
+# Chunk plan for Open Foris Collect (~1250 main-source Java files, ~280 webapp JS/TS).
+#
+# Format:  chunk_id | module_root | include_path[,include_path...]
+#   module_root  is relative to --target and becomes the agents' working dir,
+#                so they keep the module's pom.xml / package.json in view.
+#   include_path is relative to module_root; everything else under the module
+#                is excluded from the source dump.
+#
+# Chunks are sized at roughly 150-350 KB of source (~40-90k tokens) so that the
+# phase-2 prompt, which carries the dump *and* the other agent's review, stays
+# comfortably inside both agents' context.
+#
+# Ordered most-valuable-first: domain model and persistence before UI glue, so
+# an interrupted run still covers the parts that matter.
+
+# ---- collect-core: IDM domain metamodel + record model ----------------------
+# Note: an include path pulls in the *.java sitting directly in each ancestor
+# directory too, so splitting this package further would duplicate the ~250 KB
+# of classes at metamodel/ root in both halves. Left whole at ~450 KB.
+core-idm-metamodel    | collect-core | src/main/java/org/openforis/idm/metamodel
+core-idm-model        | collect-core | src/main/java/org/openforis/idm/model,src/main/java/org/openforis/idm/path,src/main/java/org/openforis/idm/geospatial,src/main/java/org/openforis/idm/util
+
+# ---- collect-core: persistence, record model, managers ---------------------
+core-persistence      | collect-core | src/main/java/org/openforis/collect/persistence
+core-model            | collect-core | src/main/java/org/openforis/collect/model,src/main/java/org/openforis/collect/metamodel
+core-manager          | collect-core | src/main/java/org/openforis/collect/manager,src/main/java/org/openforis/collect/service,src/main/java/org/openforis/collect/datacleansing,src/main/java/org/openforis/collect/concurrency,src/main/java/org/openforis/collect/application,src/main/java/org/openforis/collect/utils
+core-event-command    | collect-core | src/main/java/org/openforis/collect/event,src/main/java/org/openforis/collect/command
+
+# ---- collect-core: import/export IO (largest single package) ---------------
+core-io-data          | collect-core | src/main/java/org/openforis/collect/io/data
+core-io-metadata      | collect-core | src/main/java/org/openforis/collect/io/metadata,src/main/java/org/openforis/collect/io/parsing,src/main/java/org/openforis/collect/io/exception,src/main/java/org/openforis/collect/io/internal
+
+# ---- collect-server: web tier, the externally reachable surface ------------
+server-web            | collect-server | src/main/java/org/openforis/collect/web,src/main/java/org/openforis/collect/remoting,src/main/java/org/openforis/collect/security,src/main/java/org/openforis/collect/spring,src/main/java/org/openforis/collect/config
+server-io-metamodel   | collect-server | src/main/java/org/openforis/collect/io,src/main/java/org/openforis/collect/metamodel
+server-datacleansing  | collect-server | src/main/java/org/openforis/collect/datacleansing
+server-manager-report | collect-server | src/main/java/org/openforis/collect/manager,src/main/java/org/openforis/collect/model,src/main/java/org/openforis/collect/mondrian,src/main/java/org/openforis/collect/reporting,src/main/java/org/openforis/collect/relational,src/main/java/org/openforis/collect/event,src/main/java/org/openforis/collect/persistence,src/main/java/org/openforis/collect/geospatial,src/main/java/org/openforis/collect/earth,src/main/java/org/openforis/collect/utils
+
+# ---- collect-server: ZK survey designer UI ---------------------------------
+server-designer-vm    | collect-server | src/main/java/org/openforis/collect/designer/viewmodel
+server-designer-form  | collect-server | src/main/java/org/openforis/collect/designer/form,src/main/java/org/openforis/collect/designer/component,src/main/java/org/openforis/collect/designer/composer,src/main/java/org/openforis/collect/designer/model,src/main/java/org/openforis/collect/designer/metamodel,src/main/java/org/openforis/collect/designer/util,src/main/java/org/openforis/collect/designer/session,src/main/java/org/openforis/collect/designer/event
+
+# ---- relational database export --------------------------------------------
+rdb                   | collect-rdb | src/main
+
+# ---- installer / bootstrap --------------------------------------------------
+# Small, but it is the launcher + embedded Jetty config, so worth its own pass.
+control-panel         | collect-installation/collect-control-panel | src/main
+collect-base          | collect-base | src/main
+
+# ---- React front end --------------------------------------------------------
+web-datamanagement    | collect-webapp/frontend | src/datamanagement
+web-common-model      | collect-webapp/frontend | src/common,src/model,src/utils,src/validation
+web-app-shell         | collect-webapp/frontend | src/scenes,src/security,src/services,src/surveydesigner,src/actions,src/reducers,src/store,src/ws,src/localStorage,src/backuprestore

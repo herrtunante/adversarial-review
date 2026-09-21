@@ -13,6 +13,17 @@ logs/
 # Review output salvaged from a run (about a target project, not this tool)
 recovered/
 
+# Output of a chunked run: the per-chunk artifacts and the merged report. Same
+# reason as recovered/ -- it is about the target, and a full run is tens of MB.
+reviews/
+
+# The next driver, staged for the supervisor to install between chunks
+run_chunked_review.next.sh
+
+# Scratch copies
+*.bak
+firebase-debug.log
+
 # macOS
 .DS_Store
 
