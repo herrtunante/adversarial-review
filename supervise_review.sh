@@ -78,14 +78,15 @@ driver_running() {
     return 1
 }
 
-# Chunks in the manifest whose phase-4 report has no real status block.
+# Chunks in the manifest the driver would still run. chunk_is_reviewed is the driver's own test, from
+# lib/transient.sh: this used to ask only whether a status block existed, which answered "all chunks complete" for
+# chunks whose debate had an agent missing, so the supervisor never started the driver that would have redone them.
 incomplete_chunks() {
     local id n=0
     while IFS='|' read -r id _; do
         id="$(echo "$id" | xargs)"
         [[ -z "$id" || "$id" == \#* ]] && continue
-        grep -q -- '---SYNTHESIS_STATUS---' "$OUT/$id/artifacts/iter1_4_synthesis.md" 2>/dev/null \
-            || n=$((n + 1))
+        chunk_is_reviewed "$OUT/$id" || n=$((n + 1))
     done < <(sed 's/\r$//; s/#.*//' "$MANIFEST")
     echo "$n"
 }

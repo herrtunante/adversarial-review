@@ -207,67 +207,16 @@ chunk_stats() {
 # phase still "completes" and writes a one-line refusal into the artifact, and
 # the run is recorded as report_only. Resuming on that evidence silently keeps
 # the damaged chunk.
-chunk_is_complete() {
-    local chunk_out="$1"
-    [[ -f "$chunk_out/tracking.json" ]] || return 1
-    local synth
-    synth="$(find "$chunk_out/artifacts" -name 'iter*_4_synthesis.md' -type f 2>/dev/null | sort | tail -1)"
-    [[ -n "$synth" && -f "$synth" ]] || return 1
-    grep -q -- '---SYNTHESIS_STATUS---' "$synth" 2>/dev/null || return 1
-    # A synthesis block is not enough. An agent that was refused mid-debate leaves an artifact that parses to zero
-    # issues, and the synthesis written on top of it still carries a perfectly valid block of its own - so the chunk
-    # looked finished while only one of the two agents had taken part. --resume has to redo those.
-    ! chunk_hit_transient_failure "$chunk_out"
-}
+chunk_is_complete() { chunk_is_reviewed "$1"; }
 
 # Is this artifact a failed agent call that is worth retrying later, rather than
 # a review?
 #
 # Two shapes, and the patterns are deliberately split between them:
 #
-# - A refused or unreachable Claude call writes one short line in place of the
-#   review ("You've hit your session limit ...", "API Error: Can't reach the API
-#   server ... (ENOTFOUND)"). The broad phrases below are only trusted in files
-#   that small. Matched against a whole review they misfire: a finding about a
-#   login controller with no rate limiting reads as a quota refusal, and the
-#   chunk would be thrown away three times over.
-# - A Codex call that dies before answering has its transcript copied into the
-#   artifact (run_codex's fallback). Its transport errors are timestamped log
-#   lines, which never occur in source code or review prose, so those are safe
-#   to match in a file of any size.
-TRANSIENT_SHORT_RE='hit your (session|usage) limit|usage limit reached|quota exceeded|rate.?limit|resets [0-9]|API Error|reach the API server|ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|overloaded|stream disconnected|error sending request'
-TRANSIENT_SHORT_MAX_BYTES=2048
-TRANSIENT_LOG_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +ERROR .*(stream disconnected|error sending request|connection (reset|refused|closed)|dns error|timed out)'
-
-artifact_is_transient_failure() {
-    local f="$1"
-    [[ -f "$f" ]] || return 1
-    if [[ $(wc -c < "$f") -le $TRANSIENT_SHORT_MAX_BYTES ]] \
-       && grep -qEi -- "$TRANSIENT_SHORT_RE" "$f" 2>/dev/null; then
-        return 0
-    fi
-    # A codex transcript, copied in as an artifact by older versions of run_codex's fallback. The banner never
-    # appears in a real review, so the broad phrases can be trusted here whatever the size. Without this a quota
-    # refusal inside a 150 KB transcript read as a finished review: ten chunks of the Collect run were archived
-    # with Codex absent from the debate and nothing said so.
-    if grep -qa "OpenAI Codex v" "$f" 2>/dev/null        && grep -qEi -- "$TRANSIENT_SHORT_RE" "$f" 2>/dev/null; then
-        return 0
-    fi
-    grep -qEi -- "$TRANSIENT_LOG_RE" "$f" 2>/dev/null
-}
-
-# Did any agent in this chunk fail for a reason that goes away on its own - an
-# exhausted quota or a dropped network? Those artifacts parse to zero issues and
-# are indistinguishable from a clean review downstream, so the chunk must be
-# retried after the outage rather than recorded.
-chunk_hit_transient_failure() {
-    local chunk_out="$1" f
-    [[ -d "$chunk_out/artifacts" ]] || return 1
-    for f in "$chunk_out"/artifacts/*.md; do
-        artifact_is_transient_failure "$f" && return 0
-    done
-    return 1
-}
+# The transient-failure rules live in lib/transient.sh: the supervisor decides the same question and the two
+# answers have to agree.
+. "$SCRIPT_DIR/lib/transient.sh"
 
 # Did this chunk actually review the code it was scoped to?
 #
