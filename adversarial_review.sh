@@ -497,10 +497,23 @@ run_codex() {
     fi
     rm -f "$codex_tmp"
 
-    # Fall back to the transcript if codex died before writing the final message
+    # Codex died before writing the final message. Record a short, explicit note rather than copying the transcript:
+    # the transcript is the prompt echoed back plus the agent's reasoning, so as an artifact it would feed the next
+    # phase 100-200 KB of noise and hand parse_status_block the EXAMPLE status block out of the prompt template -
+    # which reads as "0 issues found" and is indistinguishable from a clean review. A quota refusal used to be
+    # archived that way, with the chunk counted as done and only one agent in the debate. The transcript stays in
+    # logs/ for diagnosis, and this note is short enough for artifact_is_transient_failure to recognise.
     if [[ ! -s "$output_file" ]]; then
-        log_warning "Codex produced no final message; falling back to transcript"
-        cp "$codex_log" "$output_file" 2>/dev/null || echo "Codex produced no output" > "$output_file"
+        log_warning "Codex produced no final message; recording the failure (transcript kept in $codex_log)"
+        {
+            echo "CODEX PRODUCED NO FINAL MESSAGE (exit code $exit_code)"
+            echo
+            echo "Matching lines from the transcript $codex_log :"
+            grep -aiE "error|usage limit|rate.?limit|quota|refus|timed out" "$codex_log" 2>/dev/null | tail -n 5
+            echo
+            echo "Last lines of the transcript:"
+            tail -n 3 "$codex_log" 2>/dev/null
+        } > "$output_file"
         [[ $exit_code -eq 0 ]] && exit_code=1
     fi
 

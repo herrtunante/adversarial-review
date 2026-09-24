@@ -1,0 +1,43 @@
+# What the 20-chunk plan in collect.manifest never put in front of an agent.
+#
+# Format:  chunk_id | module_root | include_path[,include_path...]
+#
+# Run with a raised line cap, because three of these files are longer than the
+# 500-line default and would be cut off mid-review:
+#
+#   ./run_chunked_review.sh --target ../collect --max-lines 1500 \
+#        -o reviews/collect-gaps chunks/collect-gaps.manifest
+#
+# How the gap was established: every .java/.js/.jsx/.ts/.tsx file under the
+# project, minus src/test and src/it, checked against the include paths of
+# collect.manifest. Note that an include path also pulls in the loose files of
+# each of its ancestor directories, so the package-root classes of
+# collect-core/.../collect/io and collect-server/.../collect were reviewed
+# already even though no include path names them - confirmed against the
+# exclude.regex each chunk saved.
+#
+# Deliberately left out:
+#   collect-core/src/generated/**            124 files of jOOQ-generated code
+#   collect-webapp/src/main/webapp/assets/** ~120 vendored libraries (bootstrap,
+#                                            jquery, ol, jstree, materialize...)
+#   **/earthFiles/{jquery,bootstrap}/**      vendored copies again
+#   src/it/**                                integration tests, as src/test is
+
+# ---- the legacy JSP front end, still served by collect-server --------------
+# 58 files, 161 KB of hand-written JS. Never reviewed: collect.manifest only
+# covers collect-webapp/frontend, the React application that replaced it.
+webapp-legacy-js    | collect-webapp | src/main/webapp/js
+
+# ---- the Collect Earth balloon assets -------------------------------------
+# 7 files, 75 KB. The survey designer packages these into every .cep, so they
+# run inside Google Earth on the interpreter's machine. earth_new.js is 1372
+# lines and earth.js 794, hence --max-lines.
+# collect-webapp/src/main/webapp/earthFiles holds a byte-identical copy; this is
+# the one that ships, and the duplication is worth a finding of its own.
+ce-balloon-assets   | collect-server | src/main/resources/org/openforis/collect/designer/templates/collectearth/earthFiles/js,src/main/resources/org/openforis/collect/designer/templates/collectearth/earthFiles/openforis
+
+# ---- hand-written patches to jOOQ internals -------------------------------
+# 2 files, 5 KB, in the org.jooq.impl package of collect-core so that they can
+# reach package-private jOOQ members. Small, but that is exactly the kind of
+# code that breaks silently on a jOOQ upgrade.
+core-jooq-patches   | collect-core | src/main/java/org/jooq

@@ -213,7 +213,11 @@ chunk_is_complete() {
     local synth
     synth="$(find "$chunk_out/artifacts" -name 'iter*_4_synthesis.md' -type f 2>/dev/null | sort | tail -1)"
     [[ -n "$synth" && -f "$synth" ]] || return 1
-    grep -q -- '---SYNTHESIS_STATUS---' "$synth" 2>/dev/null
+    grep -q -- '---SYNTHESIS_STATUS---' "$synth" 2>/dev/null || return 1
+    # A synthesis block is not enough. An agent that was refused mid-debate leaves an artifact that parses to zero
+    # issues, and the synthesis written on top of it still carries a perfectly valid block of its own - so the chunk
+    # looked finished while only one of the two agents had taken part. --resume has to redo those.
+    ! chunk_hit_transient_failure "$chunk_out"
 }
 
 # Is this artifact a failed agent call that is worth retrying later, rather than
@@ -240,6 +244,13 @@ artifact_is_transient_failure() {
     [[ -f "$f" ]] || return 1
     if [[ $(wc -c < "$f") -le $TRANSIENT_SHORT_MAX_BYTES ]] \
        && grep -qEi -- "$TRANSIENT_SHORT_RE" "$f" 2>/dev/null; then
+        return 0
+    fi
+    # A codex transcript, copied in as an artifact by older versions of run_codex's fallback. The banner never
+    # appears in a real review, so the broad phrases can be trusted here whatever the size. Without this a quota
+    # refusal inside a 150 KB transcript read as a finished review: ten chunks of the Collect run were archived
+    # with Codex absent from the debate and nothing said so.
+    if grep -qa "OpenAI Codex v" "$f" 2>/dev/null        && grep -qEi -- "$TRANSIENT_SHORT_RE" "$f" 2>/dev/null; then
         return 0
     fi
     grep -qEi -- "$TRANSIENT_LOG_RE" "$f" 2>/dev/null

@@ -28,6 +28,9 @@ TARGET=""
 OUT=""
 MANIFEST=""
 TIMEOUT_MIN=15
+# Passed straight through to the driver. A chunk whose files are longer than the default line cap needs this, or
+# the agents review a truncated file and never know it.
+EXTRA_ARGS=()
 RETRY_WAIT=1800        # after a driver gives up on a dead CLI
 CRASH_WAIT=300         # after any other unexpected exit
 MAX_RESTARTS=48        # 24h of 30-minute retries, then stop
@@ -38,12 +41,15 @@ while [[ $# -gt 0 ]]; do
         --target)     TARGET="$2"; shift 2 ;;
         -o|--out)     OUT="$2"; shift 2 ;;
         -t|--timeout) TIMEOUT_MIN="$2"; shift 2 ;;
+        --max-lines|--max-files)
+                      EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --only)       EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         *)            MANIFEST="$1"; shift ;;
     esac
 done
 
 [[ -n "$TARGET" && -n "$OUT" && -n "$MANIFEST" ]] || {
-    echo "usage: $0 --target DIR -o OUT_DIR MANIFEST" >&2
+    echo "usage: $0 --target DIR -o OUT_DIR [-t MIN] [--max-lines N] [--max-files N] [--only GLOB] MANIFEST" >&2
     exit 1
 }
 
@@ -152,6 +158,6 @@ while :; do
     fi
 
     say "starting driver ($left chunk(s) left)"
-    "$DRIVER" --target "$TARGET" -t "$TIMEOUT_MIN" --resume -o "$OUT" "$MANIFEST" >> "$LOG" 2>&1
+    "$DRIVER" --target "$TARGET" -t "$TIMEOUT_MIN" "${EXTRA_ARGS[@]}" --resume -o "$OUT" "$MANIFEST" >> "$LOG" 2>&1
     say "driver exited with code $?"
 done
