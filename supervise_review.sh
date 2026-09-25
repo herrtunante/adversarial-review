@@ -53,6 +53,11 @@ done
     exit 1
 }
 
+# chunk_is_reviewed and the rules behind it, shared with the driver so the two agree on what "done" means.
+# Without this the function is simply undefined here, every call exits 127, and incomplete_chunks counts every
+# chunk in the manifest as unfinished - which is what made this restart a twenty-chunk run that needed seven.
+. "$SCRIPT_DIR/lib/transient.sh"
+
 cd "$SCRIPT_DIR" || exit 1
 mkdir -p "$OUT"
 LOG="$OUT/driver.log"
