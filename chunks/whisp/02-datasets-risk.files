@@ -1,0 +1,7 @@
+# WHISP python package: dataset definitions, asset registry, risk logic, output formatting
+src/openforis_whisp/datasets.py
+src/openforis_whisp/asset_registry.py
+src/openforis_whisp/risk.py
+src/openforis_whisp/reformat.py
+src/openforis_whisp/pd_schemas.py
+src/openforis_whisp/parameters/config_runtime.py

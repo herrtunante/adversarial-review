@@ -183,6 +183,13 @@ dropped *before* the cap applies, so vendored or generated trees don't consume t
 This is the only scoping lever the collector has — it can subtract but never restrict to a subtree,
 which is why `run_chunked_review.sh` has to enumerate the complement of what it wants to keep.
 
+`SOURCE_FILE_LIST` is the other lever, and the only one that restricts: it names a file holding one
+path per line (relative to the target; blank lines and `#` comments ignored), and the dump is then
+exactly those files, in that order. The directory walk, the per-language caps and
+`MAX_SOURCE_EXCLUDE` are all skipped; only `MAX_SOURCE_LINES` still applies, so raise it if any
+listed file is longer than 500 lines. Any file type is accepted, which also makes it the way to
+review a language the walk ignores. A listed path that does not exist is warned about and skipped.
+
 Two caps-related gotchas:
 
 - The find for TS/JS excludes `node_modules` but **not** `target/`, `dist/` or `build/`. On a Maven
@@ -264,6 +271,16 @@ nohup ./supervise_review.sh --target ../collect -o reviews/run1 chunks/collect.m
 To review two targets at once, run the second from a separate `git worktree`. All state lives in
 the script's own directory, so a second checkout gets its own `artifacts/`, lock and breaker. Both
 runs still draw on the same Claude session quota.
+
+When a manifest cannot express the split (all the code is in one directory, or the files are
+scattered across directories or repos), use `run_filelist_review.sh` with one `SOURCE_FILE_LIST`
+file per chunk. It archives each chunk the same way, skips chunks `chunk_is_reviewed` accepts, and
+runs `aggregate_review.sh` at the end. It is report-only and simpler than the driver: a few retries
+per chunk, no waiting out a quota reset, no salvage.
+
+```bash
+nohup ./run_filelist_review.sh --target ../whisp -o reviews/whisp chunks/whisp/*.files > reviews/whisp.log 2>&1 &
+```
 
 Sizing: aim for 150–350 KB of source per chunk. Phase 2 sends the dump *plus* the other agent's
 review, so the real prompt is larger than the chunk. Cost is ~7 agent calls per chunk per

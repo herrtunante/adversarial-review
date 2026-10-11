@@ -1,0 +1,31 @@
+# Earth Map: Vertex AI / Gemini integration, backend + portal. Paths relative to /c/Users/Alfonso Sanchez-Paus/git
+# Backend (earth-map-cloud-functions): AI module, its entry points, config and auth
+earth-map-cloud-functions/functions/aiInsights/AssistantHandler.js
+earth-map-cloud-functions/functions/aiInsights/AssistantHelper.js
+earth-map-cloud-functions/functions/aiInsights/AssistantsConfig.js
+earth-map-cloud-functions/functions/aiInsights/GoogleVertexAssisstantHelper.js
+earth-map-cloud-functions/functions/aiInsights/LayerDescriptionGenerator.js
+earth-map-cloud-functions/functions/aiInsights/LayerMetadataGenerator.js
+earth-map-cloud-functions/functions/aiInsights/OpenAIAssistantHelper.js
+earth-map-cloud-functions/functions/aiInsights/TranslationHelper.js
+earth-map-cloud-functions/functions/aiInsights/WebTileLayerMetadataGenerator.js
+earth-map-cloud-functions/functions/aiInsights/htmlSanitizer.js
+earth-map-cloud-functions/functions/aiInsights/promptHelpers.js
+earth-map-cloud-functions/functions/aiInsights/whispPrompt.js
+earth-map-cloud-functions/functions/index.js
+earth-map-cloud-functions/functions/api/router.js
+earth-map-cloud-functions/functions/config/index.js
+earth-map-cloud-functions/functions/middleware/auth.js
+# Portal (earthmap-portal): callers of the AI endpoints
+earthmap-portal/src/api/earthMapEE/endpoints.js
+earthmap-portal/src/api/earthMapEE/earthmapEE.js
+earthmap-portal/src/api/adminUtils.js
+earthmap-portal/src/utils/firebaseUtils.js
+earthmap-portal/src/components/Dialogs/AiAnalysisLauncher.js
+earthmap-portal/src/components/Dialogs/AiAnalysisExplorer.js
+earthmap-portal/src/stores/AiThreadsStore.js
+earthmap-portal/src/hooks/useScripts.js
+earthmap-portal/src/components/MultiCriteria/AiRecipeWizard.js
+earthmap-portal/src/components/Admin/Layers/Form/GeoJSON/AiTemplateGenerator.js
+earthmap-portal/src/components/Statistics/StatisticsCard/StatisticsResults/Chart/whispAiPayload.js
+earthmap-portal/src/components/Admin/MultilingualTextField.js

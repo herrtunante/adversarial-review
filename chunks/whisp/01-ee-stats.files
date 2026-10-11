@@ -1,0 +1,6 @@
+# WHISP python package: Earth Engine stats pipeline and public entry points
+pyproject.toml
+src/openforis_whisp/__init__.py
+src/openforis_whisp/control_flow.py
+src/openforis_whisp/stats.py
+src/openforis_whisp/advanced_stats.py

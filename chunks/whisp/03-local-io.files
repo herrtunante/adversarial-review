@@ -1,0 +1,6 @@
+# WHISP python package: local stats, input conversion and checks, utilities
+src/openforis_whisp/local_stats.py
+src/openforis_whisp/data_conversion.py
+src/openforis_whisp/data_checks.py
+src/openforis_whisp/utils.py
+src/openforis_whisp/logger.py

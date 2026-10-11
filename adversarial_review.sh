@@ -63,6 +63,9 @@ MAX_SOURCE_LINES="${MAX_SOURCE_LINES:-500}"
 MAX_SOURCE_SHELL_FILES="${MAX_SOURCE_SHELL_FILES:-10}"
 MAX_SOURCE_SHELL_LINES="${MAX_SOURCE_SHELL_LINES:-300}"
 MAX_SOURCE_EXCLUDE="${MAX_SOURCE_EXCLUDE:-}"
+# A file naming exactly the files to review, one path per line relative to the
+# target. When set it replaces the directory walk and the per-language caps.
+SOURCE_FILE_LIST="${SOURCE_FILE_LIST:-}"
 
 # Colors
 RED='\033[0;31m'
@@ -345,6 +348,34 @@ collect_source_code() {
 
     if [[ "$CHANGED_ONLY" == "1" ]]; then
         collect_changed_files "$target_dir"
+        return 0
+    fi
+
+    # Review exactly the listed files (blank lines and # comments ignored).
+    # Unlike MAX_SOURCE_EXCLUDE this can restrict to scattered files, which a
+    # feature cutting across several directories or repos needs, and it can
+    # split a single directory, which a chunk manifest cannot. Any file type is
+    # accepted, so it is also the way to review a language the walk below skips.
+    if [[ -n "$SOURCE_FILE_LIST" ]]; then
+        if [[ ! -f "$SOURCE_FILE_LIST" ]]; then
+            log_error "SOURCE_FILE_LIST not found: $SOURCE_FILE_LIST" >&2
+            return 1
+        fi
+        local rel
+        while IFS= read -r rel || [[ -n "$rel" ]]; do
+            rel="${rel%$'\r'}"
+            [[ -z "$rel" || "$rel" == \#* ]] && continue
+            if [[ ! -f "$target_dir/$rel" ]]; then
+                # stderr: this function's stdout is the source dump itself.
+                log_warning "SOURCE_FILE_LIST: missing $rel" >&2
+                continue
+            fi
+            output+="
+=== FILE: $rel ===
+$(head -$max_lines "$target_dir/$rel" 2>/dev/null)
+"
+        done < "$SOURCE_FILE_LIST"
+        echo "$output"
         return 0
     fi
 
@@ -1380,6 +1411,16 @@ main() {
     if [[ ! -d "$target_dir" ]]; then
         log_error "Directory does not exist: $target_dir"
         exit 1
+    fi
+
+    # Fail here rather than in collect_source_code: its caller reads it through
+    # $(...), where a failure is only an empty dump and the agents review nothing.
+    if [[ -n "$SOURCE_FILE_LIST" ]]; then
+        if [[ ! -f "$SOURCE_FILE_LIST" ]]; then
+            log_error "SOURCE_FILE_LIST not found: $SOURCE_FILE_LIST"
+            exit 1
+        fi
+        SOURCE_FILE_LIST="$(cd "$(dirname "$SOURCE_FILE_LIST")" && pwd)/$(basename "$SOURCE_FILE_LIST")"
     fi
 
     check_dependencies
