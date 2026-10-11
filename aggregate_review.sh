@@ -74,9 +74,10 @@ strip_status() {
 
 chunk_dirs=()
 while IFS= read -r d; do
-    # The driver writes exclude.regex into every chunk directory, so its
-    # presence is what marks one. This skips the report's own web/ folder.
-    [[ -f "$d/exclude.regex" ]] || continue
+    # The driver writes exclude.regex into every chunk directory, and
+    # run_filelist_review.sh writes files.list, so either one marks a chunk.
+    # This skips the report's own web/ folder.
+    [[ -f "$d/exclude.regex" || -f "$d/files.list" ]] || continue
     chunk_dirs+=("$d")
 done < <(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
 
@@ -174,7 +175,7 @@ json_chunks="${json_chunks%,}"
         echo "### Chunk: $cid"
         echo ""
         if [[ -n "$synth" && -f "$synth" ]]; then
-            if [[ -f "$d/exclude.regex" ]]; then
+            if [[ -f "$d/exclude.regex" || -f "$d/files.list" ]]; then
                 echo "<details><summary>scope</summary>"
                 echo ""
                 echo '```'

@@ -104,6 +104,8 @@ for list in "${ABS_LISTS[@]}"; do
         rm -rf "$chunk_out"; mkdir -p "$chunk_out"
         cp -r artifacts logs "$chunk_out/" 2>/dev/null || true
         cp tracking.json "$chunk_out/" 2>/dev/null || true
+        # What the chunk covered; aggregate_review.sh also uses it to tell a chunk directory from any other.
+        cp "$list" "$chunk_out/files.list" 2>/dev/null || true
 
         if chunk_is_reviewed "$chunk_out"; then
             log "$chunk: done (exit $rc)"
