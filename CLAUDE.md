@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What This Is
 
 A Bash orchestrator that runs two AI CLIs (`claude` and `codex`) through a 4-phase adversarial
-debate over a *target* project's source code, then has Claude implement the agreed fixes **in that
-target project**. This repo holds only the orchestration — it never reviews itself by default.
+debate over a *target* project's source code and writes a report of the agreed fixes. With `--fix`
+Claude also implements them **in that target project**. This repo holds only the orchestration — it never reviews itself by default.
 
 Status: experimental prototype. No test suite exists yet.
 
@@ -15,7 +15,8 @@ Status: experimental prototype. No test suite exists yet.
 There is no build, package manager, or test runner. The only entry point is the script:
 
 ```bash
-./adversarial_review.sh <target_dir>                 # Full review of another project
+./adversarial_review.sh <target_dir>                 # Review another project, report only (default)
+./adversarial_review.sh --fix <target_dir>           # Review, then let Claude edit the target
 ./adversarial_review.sh --dry-run <target_dir>       # Stubs out every agent call; safe to run
 ./adversarial_review.sh -m 5 -v -t 15 <target_dir>   # 5 iterations, verbose, 15m agent timeout
 ./adversarial_review.sh --status                     # Read tracking.json
@@ -27,7 +28,13 @@ bash -n adversarial_review.sh lib/*.sh               # Syntax check (fastest smo
 shellcheck adversarial_review.sh lib/*.sh            # Lint, if installed
 ```
 
-Env vars override the flags: `MAX_ITERATIONS`, `TIMEOUT_MINUTES`, `VERBOSE=1`, `DRY_RUN=1`, plus
+Report-only is the default since the self-review of October 2026; fixing needs `--fix` (or
+`NO_FIX=0`), and `--no-fix` is still accepted. A report-only run is one iteration, 7 agent calls.
+`-m` and `-t` must be positive integers, and a flag missing its value is an error.
+
+Env vars override the flags: `MAX_ITERATIONS`, `TIMEOUT_MINUTES`, `VERBOSE=1`, `DRY_RUN=1`,
+`NO_FIX` (0 or 1), `FROM_PHASE`, `CODEX_BIN` (used as given; the run stops if it does not answer
+`--version`), `FIX_MODE_TOOLS` (the tool list for fix mode), plus
 the circuit-breaker thresholds `CB_NO_PROGRESS_THRESHOLD`, `CB_DISAGREEMENT_THRESHOLD`,
 `CB_SAME_ISSUES_THRESHOLD`.
 
@@ -68,9 +75,19 @@ Two Windows-specific problems have been fixed in the script; don't reintroduce t
   `failed to load models cache: missing field supports_parallel_tool_calls` on startup. Harmless —
   it refetches — but `codex doctor` or deleting that file silences it.
 
-### Agent CLI invocation (verified against codex-cli 0.147.0 / claude 2.1.252)
+### Agent CLI invocation (verified against codex-cli 0.147.0 / claude 2.1.296)
 
-`claude --print [--dangerously-skip-permissions]` is unchanged and current.
+Phases 1 to 3 and a report-only phase 4 run plain `claude --print`. Fix mode runs
+`claude --print --tools Read,Grep,Glob,Edit,Write --allowedTools Read,Grep,Glob,Edit,Write`:
+`--tools` removes the shell, `--allowedTools` pre-approves the rest. It replaced
+`--dangerously-skip-permissions`, because the phase-4 prompt quotes the target's source and a
+comment planted there could reach an agent with unrestricted shell access. The cost is that the
+fixing agent cannot run tests or git, and an allowlist is not filesystem containment: use `--fix`
+only on code you trust.
+
+Claude's stderr goes to `logs/<artifact>.claude.log`, never into the artifact. A Claude call that
+exits non-zero or prints nothing leaves `CLAUDE PRODUCED NO OUTPUT (exit code N)` as the artifact's
+first line, with the matching error lines under it, the same way `run_codex` leaves its note.
 
 `run_codex()` was written for a pre-0.30 codex (`codex -q --full-auto --prompt "$prompt"`) and has
 been rewritten. Three constraints, all load-bearing:
@@ -111,9 +128,9 @@ phase 2 carries the source dump: `cross_review.md` asks the agent to *verify* fi
 issues the other agent missed, neither of which is possible from review prose alone.
 
 Phases 1–3 run their two agents as background jobs and `wait` on both. Phase 4 is the only phase
-that **writes code**: it invokes `claude --print --dangerously-skip-permissions` with the target
-directory as cwd, so the target project is modified in place with no permission prompts. Treat
-running this against a dirty working tree as destructive — the target should be committed first.
+that can **write code**, and only with `--fix`: it then runs Claude with the edit-only tool list and
+the target directory as cwd, so the target project is modified in place with no permission prompts.
+Treat running `--fix` against a dirty working tree as destructive — the target should be committed first.
 
 ### The status-block protocol
 
@@ -149,8 +166,9 @@ A CLOSED → HALF_OPEN → OPEN state machine, fed exactly once per iteration by
 grounded in observable state rather than agent self-report, because each was previously either
 unfalsifiable or dead:
 
-- **Progress** — whether `target_state_hash` (a hash of `git status --porcelain` plus staged and
-  unstaged diffs in the target) changed across phase 4. `FILES_MODIFIED` from the synthesis block
+- **Progress** — whether `target_state_hash` (a hash of `HEAD`, `git status --porcelain`, the staged
+  and unstaged diffs and the content of untracked files in the target) changed across phase 4, so a
+  commit by the agent or an edit to an untracked file counts. `FILES_MODIFIED` from the synthesis block
   is logged for comparison but no longer drives the breaker; it is self-reported, and a missing
   status block parses to `0`, which read as a stall on what was really a parse failure. Non-git
   targets fall back to the self-report with a warning.
@@ -166,7 +184,9 @@ Any of the three can open the breaker, from CLOSED or from HALF_OPEN. Before, HA
 tested progress, so persistent disagreement could never open it with the default thresholds.
 
 OPEN is terminal and requires `--reset-circuit`; `can_execute` is checked at the top of each
-iteration. Note that a `--dry-run` drives the breaker to OPEN, so reset before a real run.
+iteration. Note that a `--fix --dry-run` drives the breaker to OPEN, so reset before a real run; a
+report-only run returns before the breaker is fed. The counters and the issues hash are reset at the
+start of a run whose target differs from the previous one, unless the breaker is OPEN.
 
 ### Agent failure handling
 
@@ -188,7 +208,10 @@ outlive the stop.
 `collect_source_code()` builds one flat text dump and is the only thing the agents see in phase 1
 — they do get the target as cwd, but the prompt itself is this dump. It walks **Java, Python and
 TS/JS at `MAX_SOURCE_FILES` each (default 30) and shell at `MAX_SOURCE_SHELL_FILES` (default 10)**,
-truncating to `MAX_SOURCE_LINES` / `MAX_SOURCE_SHELL_LINES` (500 / 300). A file cut at the cap carries a
+truncating to `MAX_SOURCE_LINES` / `MAX_SOURCE_SHELL_LINES` (500 / 300). The path filters (hidden
+directories, `node_modules`, `target/`, `build/`) are tested against the path relative to the
+target, so a target that itself sits under a dot directory or a `build/` folder still yields its
+files, and the driver's `--list` estimate selects files the same way the collector does. A file cut at the cap carries a
 `FILE TRUNCATED BY THE REVIEW TOOL` line in the dump, so agents know they saw only part of it. Any other language (Go,
 Rust, C…) is still invisible. Widening coverage or the caps happens here and directly drives prompt
 size and cost.
@@ -251,10 +274,19 @@ Things the driver has to do because state in this repo is global, not per-run:
   once let two drivers run at the same time: one chunk's report was built from another package's
   prompt and still carried a valid status block. `reset_all()` now refuses while a live pid holds
   the lock, and the driver aborts if it finds one.
+- **The driver holds its own lock for the whole run.** `.review.lock` belongs to
+  `adversarial_review.sh` and is absent in the gap between two chunks, exactly when the driver
+  clears and archives `artifacts/`. So the driver and `run_filelist_review.sh` take `.driver.lock/`
+  (a directory made with `mkdir`, holding `pid`) and export `AR_DRIVER_LOCK_PID` to the reviews
+  they start. A second driver or wrapper exits 4. `adversarial_review.sh` refuses to start, dry
+  runs included, while a live `.driver.lock` names a pid that is neither `$AR_DRIVER_LOCK_PID` nor
+  its parent. A lock whose pid is dead is taken over. On INT or TERM the driver stops its review,
+  releases the lock and exits 130 or 143.
 - The circuit breaker persists across invocations and OPEN is terminal, so the driver calls
   `--reset-circuit` per chunk. Without it one stalled chunk blocks every later one.
-- Chunks default to `--no-fix`. Twenty unattended synthesis passes writing into a shared target is
-  not something to start by accident; `--fix` opts in.
+- Chunks default to report-only. Twenty unattended synthesis passes writing into a shared target is
+  not something to start by accident; `--fix` opts in, and the driver passes `--fix` or `--no-fix`
+  to every review explicitly.
 
 `chunk_is_reviewed` in `lib/transient.sh` is the one answer to "is this chunk reviewed?", shared by
 the driver, the supervisor, the file-list wrapper and the aggregator. The newest synthesis report
@@ -272,22 +304,31 @@ A chunk is only archived as done if it also survives three checks:
   holding a quota or connection error, or Codex's timestamped transport `ERROR` lines. The broad
   phrases are only trusted in short files; in a full review they match findings about rate
   limiting. A short file with a complete status block or a bare `NO_ISSUES` is a real answer and is
-  never treated as a refusal. A Codex timeout is a failed call but not a transient one: the chunk
-  is rejected by `chunk_is_reviewed` and redone on the next `--resume`, without the quota wait. On a hit the driver waits for
-  `claude --print` to answer a probe (every 5 minutes, up to 2 hours) and redoes the chunk.
+  never treated as a refusal. On a hit the driver waits
+  until BOTH agent CLIs answer a small probe (every 5 minutes, up to 2 hours) and redoes the chunk;
+  probing Claude alone returned at once whenever Codex was the refused one.
+- **Any other failed call.** A Codex timeout, or a Claude call that printed nothing, is a failed
+  call but not a transient one. The chunk is redone within the same run, up to three attempts,
+  with no quota wait, and is recorded as `agent_failure` if it never succeeds.
 - **Scope contamination.** The Codex transcript echoes the prompt, so its `=== FILE:` markers are a
   record of what the agent was really shown. Any path the chunk's exclude regex would have dropped
   means the artifacts came from another run.
 - **Salvage.** If only synthesis failed, the six debate artifacts are kept and the retry runs
-  `adversarial_review.sh --from-phase 4`, costing one agent call instead of seven.
-  `verify_resume_artifacts` refuses to start mid-run if any earlier artifact is missing or under
-  200 bytes.
+  `adversarial_review.sh --from-phase 4`, costing one agent call instead of seven. A debate with
+  any failed call in it is not salvaged. `verify_resume_artifacts` refuses to start mid-run if an
+  earlier artifact is missing, under 200 bytes or a failure note, or if `artifacts/scope.stamp`
+  does not match. Phase 1 writes that stamp (the canonical target path and a hash of the source
+  dump) so a saved debate cannot be resumed against another target or changed source; the same
+  `MAX_SOURCE_*`, exclude and file-list settings are therefore needed to resume. Debates saved
+  before the stamp existed are refused, and the driver then reruns the chunk in full.
 
 Long runs outlive the harness: a background task can be killed for "low memory" while the review
 underneath keeps going. Start the driver with `nohup ... &` writing to a log, and check `/proc` for
 a live driver (see the Windows notes above) before starting another. `.review.lock` alone does not
 prove the coast is clear: it is held by `adversarial_review.sh`, so it is absent in the gap between
-two chunks while the driver is still alive.
+two chunks while the driver is still alive. `.driver.lock/pid` does cover that gap; if a crashed
+driver's pid was reused by an unrelated process the lock looks live, and the directory has to be
+removed by hand.
 
 For an unattended run, start `supervise_review.sh` instead of the driver. The driver gives up after
 two hours without a working agent CLI, which an overnight quota reset or a sleeping laptop easily
@@ -314,7 +355,8 @@ When a manifest cannot express the split (all the code is in one directory, or t
 scattered across directories or repos), use `run_filelist_review.sh` with one `SOURCE_FILE_LIST`
 file per chunk. It archives each chunk the same way, skips chunks `chunk_is_reviewed` accepts, and
 runs `aggregate_review.sh` at the end. It is report-only and simpler than the driver: a few retries
-per chunk, no waiting out a quota reset, no salvage.
+per chunk, no waiting out a quota reset, no salvage. It takes the same `.driver.lock` (exit 4 if a
+driver or another wrapper holds it) and does not retry a chunk that ended as `empty_scope`.
 
 ```bash
 nohup ./run_filelist_review.sh --target ../whisp -o reviews/whisp chunks/whisp/*.files > reviews/whisp.log 2>&1 &
@@ -350,7 +392,7 @@ halves rather than dividing it.
   code uses `((iteration++)) || true`; keep that pattern.
 - Timeouts go through `get_timeout_cmd`, preferring `gtimeout` (macOS coreutils) then `timeout`.
   With neither, agent calls run unbounded — only a warning is printed.
-- Cost: ~7 agent invocations per iteration (2+2+2+1), so a default 3-iteration run is ~21 calls.
+- Cost: ~7 agent invocations per iteration (2+2+2+1), so the default report-only run is 7 calls and a 3-iteration `--fix` run is ~21.
   No cost tracking exists. Use `--dry-run` for anything structural.
 
 ## Adding a Third Agent
@@ -363,8 +405,9 @@ one "other agent" and would need rewording.
 ## State Files
 
 `tracking.json` (iteration, status, target, append-only `history[]`), `.circuit_breaker.json`,
-`.circuit_breaker_history.json`, `.response_analysis.json`, `artifacts/`, `logs/` — all gitignored
-and regenerated. `artifacts/iter{N}_{phase}_{agent}_{type}.md` is the naming convention.
+`.circuit_breaker_history.json`, `.response_analysis.json`, `artifacts/` (with `scope.stamp`),
+`logs/` (with `*.codex.log` and `*.claude.log`), and the locks `.review.lock`,
+`.review.lock.recover/` and `.driver.lock/` — all gitignored and regenerated. `artifacts/iter{N}_{phase}_{agent}_{type}.md` is the naming convention.
 
 ## Reference
 

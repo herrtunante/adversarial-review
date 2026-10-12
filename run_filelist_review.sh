@@ -22,6 +22,10 @@
 #
 # Simpler than the chunk driver: it retries a refused agent a few times but does
 # not wait out a long quota reset, and it does not salvage a finished debate.
+#
+# Exit codes: 0 every chunk reviewed, 1 bad arguments or a chunk without a
+# complete review, 4 another driver or wrapper is working in this checkout,
+# 130/143 stopped by INT/TERM.
 
 set -uo pipefail
 
@@ -37,7 +41,7 @@ RETRY_WAIT=300
 LISTS=()
 
 usage() {
-    sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -84,6 +88,96 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 # All state lives next to the script, whatever directory this was started from.
 cd "$SCRIPT_DIR" || exit 1
 
+# --- driver lock ---------------------------------------------------------------
+#
+# The same lock run_chunked_review.sh takes, for the same reason: .review.lock
+# belongs to adversarial_review.sh and is absent between two reviews, which is
+# when artifacts/ is cleared and archived here. A directory, because mkdir
+# either creates it or fails with nothing in between; the pid inside says who
+# holds it. adversarial_review.sh refuses to start under a live lock unless
+# AR_DRIVER_LOCK_PID says the holder started it.
+DRIVER_LOCK="$SCRIPT_DIR/.driver.lock"
+DRIVER_LOCK_HELD=0
+REVIEW_PID=""
+
+acquire_driver_lock() {
+    local holder="" tries=0 took_over=0
+    while ! mkdir "$DRIVER_LOCK" 2>/dev/null; do
+        holder="$(cat "$DRIVER_LOCK/pid" 2>/dev/null | tr -d '\r\n ' || true)"
+        if [[ "$holder" =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null; then
+            echo "another driver or wrapper is running in this checkout (pid $holder holds $DRIVER_LOCK)" >&2
+            echo "wait for it to finish, or use a separate git worktree; nothing was touched" >&2
+            echo "if no such run exists (see /proc, not ps), remove that directory and start again" >&2
+            exit 4
+        fi
+        # No pid yet: the holder may be between its mkdir and its write.
+        tries=$((tries + 1))
+        if [[ -z "$holder" && $tries -le 5 ]]; then
+            sleep 1
+            continue
+        fi
+        if (( tries > 10 )); then
+            echo "cannot take $DRIVER_LOCK - remove it by hand if no run is alive" >&2
+            exit 4
+        fi
+        log "removing stale driver lock left by pid ${holder:-unknown}"
+        rm -rf "$DRIVER_LOCK"
+        took_over=1
+    done
+    # The directory can vanish between the mkdir and this write, when another
+    # process was already removing what it took for a stale lock.
+    if ! { echo $$ > "$DRIVER_LOCK/pid"; } 2>/dev/null; then
+        echo "another driver removed $DRIVER_LOCK while it was being taken - nothing was touched" >&2
+        exit 4
+    fi
+    DRIVER_LOCK_HELD=1
+    # Two processes can both find the same dead pid and both remove the lock; the
+    # second then deletes the first one's fresh lock. Look again after a moment
+    # and stand down if the pid inside is no longer ours.
+    if [[ $took_over -eq 1 ]]; then
+        sleep 1
+        holder="$(cat "$DRIVER_LOCK/pid" 2>/dev/null | tr -d '\r\n ' || true)"
+        if [[ "$holder" != "$$" ]]; then
+            DRIVER_LOCK_HELD=0
+            echo "another driver took $DRIVER_LOCK at the same moment (pid ${holder:-unknown}) - nothing was touched" >&2
+            exit 4
+        fi
+    fi
+    export AR_DRIVER_LOCK_PID=$$
+}
+
+release_driver_lock() {
+    [[ "$DRIVER_LOCK_HELD" == "1" ]] || return 0
+    DRIVER_LOCK_HELD=0
+    # Only our own: after a takeover race the directory may belong to someone else.
+    if [[ "$(cat "$DRIVER_LOCK/pid" 2>/dev/null | tr -d '\r\n ' || true)" == "$$" ]]; then
+        rm -rf "$DRIVER_LOCK"
+    fi
+    return 0
+}
+
+# adversarial_review.sh traps TERM itself, stops its agents and removes .review.lock.
+on_signal() {
+    local sig="$1" code="$2" n=0
+    trap '' INT TERM
+    log "received $sig - stopping the running review and releasing the driver lock"
+    if [[ -n "$REVIEW_PID" ]] && kill -0 "$REVIEW_PID" 2>/dev/null; then
+        kill -TERM "$REVIEW_PID" 2>/dev/null || true
+        while kill -0 "$REVIEW_PID" 2>/dev/null && (( n < 20 )); do
+            sleep 1
+            n=$((n + 1))
+        done
+        kill -0 "$REVIEW_PID" 2>/dev/null && kill -KILL "$REVIEW_PID" 2>/dev/null
+    fi
+    exit "$code"
+}
+
+# Held from before the first clear of artifacts/ until after the aggregate.
+trap release_driver_lock EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+acquire_driver_lock
+
 failed=0
 for list in "${ABS_LISTS[@]}"; do
     chunk="$(basename "$list" .files)"
@@ -101,14 +195,20 @@ for list in "${ABS_LISTS[@]}"; do
             log "another review holds .review.lock; aborting"
             exit 1
         fi
-        rm -f artifacts/iter*.md logs/iter*.log 2>/dev/null || true
+        # scope.stamp belongs to the artifacts it was written with: left behind, it would vouch for the next chunk's.
+        rm -f artifacts/iter*.md artifacts/scope.stamp logs/iter*.log 2>/dev/null || true
         "$REVIEW_SH" --reset-circuit > /dev/null 2>&1 || true
 
         log "$chunk: attempt $attempt of $MAX_ATTEMPTS"
+        # In the background and waited for: bash runs a trapped TERM only after a foreground command returns,
+        # which would hold the stop back until the review was over.
         SOURCE_FILE_LIST="$list" MAX_SOURCE_LINES="$SRC_LINES" \
             "$REVIEW_SH" --no-fix -m 1 -t "$TIMEOUT_MIN" -v "$TARGET" \
-            > "$OUT/$chunk.attempt$attempt.log" 2>&1
+            > "$OUT/$chunk.attempt$attempt.log" 2>&1 &
+        REVIEW_PID=$!
+        wait "$REVIEW_PID"
         rc=$?
+        REVIEW_PID=""
 
         rm -rf "$chunk_out"; mkdir -p "$chunk_out"
         cp -r artifacts logs "$chunk_out/" 2>/dev/null || true
@@ -128,7 +228,11 @@ for list in "${ABS_LISTS[@]}"; do
         fi
         log "$chunk: no complete review (exit $rc), see $OUT/$chunk.attempt$attempt.log"
         attempt=$((attempt + 1))
-        [[ $attempt -le $MAX_ATTEMPTS ]] && sleep "$RETRY_WAIT"
+        if [[ $attempt -le $MAX_ATTEMPTS ]]; then
+            # Interruptible, for the same reason as the review above.
+            sleep "$RETRY_WAIT" &
+            wait $!
+        fi
     done
     [[ $done_ok -eq 1 ]] || failed=$((failed + 1))
 done

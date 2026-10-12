@@ -44,15 +44,36 @@ latest_iter_artifact() {
     return 0
 }
 
-artifact_is_codex_no_message() {
+# The same for Claude: written by run_claude as the first line of the artifact when the call exited non-zero or
+# printed nothing. run_claude keeps stderr out of the artifact, so without this note a refusal printed on stderr
+# would leave an empty file and one printed on stdout a bare line, with nothing to say the call had failed. Up to
+# five lines of what the CLI did print follow the note; those are what tell a quota or network failure from a
+# timeout or a crash.
+CLAUDE_NO_OUTPUT_RE='^CLAUDE PRODUCED NO OUTPUT \(exit code [0-9]+\)'
+
+# Is the first non-blank line of file $1 a match for the regex $2?
+artifact_first_line_matches() {
     local line
     [[ -f "$1" ]] || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-        [[ "$line" =~ $CODEX_NO_MESSAGE_RE ]]
+        [[ "$line" =~ $2 ]]
         return
     done < "$1"
     return 1
+}
+
+artifact_is_codex_no_message() {
+    artifact_first_line_matches "$1" "$CODEX_NO_MESSAGE_RE"
+}
+
+artifact_is_claude_no_output() {
+    artifact_first_line_matches "$1" "$CLAUDE_NO_OUTPUT_RE"
+}
+
+# Either agent's failure note.
+artifact_is_failure_note() {
+    artifact_is_codex_no_message "$1" || artifact_is_claude_no_output "$1"
 }
 
 # An agent that answered: a complete status block for one of the four phases, or the bare NO_ISSUES line that
@@ -69,11 +90,11 @@ artifact_is_transient_failure() {
     local f="$1"
     [[ -f "$f" ]] || return 1
     # A short file is only a refusal if it is not a real answer: a genuine 1 KB review that says "no rate limiting
-    # on the login endpoint" used to be discarded as a quota refusal. The exemption does not apply to the Codex
-    # no-final-message note, whose quoted transcript lines can contain the prompt's example status block.
+    # on the login endpoint" used to be discarded as a quota refusal. The exemption does not apply to an agent's
+    # failure note, whose quoted lines can contain the prompt's example status block.
     if [[ $(wc -c < "$f") -le $TRANSIENT_SHORT_MAX_BYTES ]] \
        && grep -qEi -- "$TRANSIENT_SHORT_RE" "$f" 2>/dev/null \
-       && { artifact_is_codex_no_message "$f" || ! artifact_has_real_answer "$f"; }; then
+       && { artifact_is_failure_note "$f" || ! artifact_has_real_answer "$f"; }; then
         return 0
     fi
     if grep -qa -- "$TRANSIENT_CODEX_BANNER" "$f" 2>/dev/null \
@@ -95,7 +116,7 @@ chunk_hit_transient_failure() {
     return 1
 }
 
-# A failed agent call of any kind, transient or not: the two shapes above, the Codex no-final-message note (a
+# A failed agent call of any kind, transient or not: the two shapes above, either agent's failure note (a
 # timeout is exit code 124 and matches no quota pattern), or an artifact with nothing in it. Wider than
 # artifact_is_transient_failure on purpose - that one decides whether waiting for the quota is worth it, this one
 # decides whether the debate had both agents in it.
@@ -103,7 +124,7 @@ artifact_is_failed_call() {
     local f="$1"
     [[ -f "$f" ]] || return 1
     [[ -s "$f" ]] || return 0
-    artifact_is_codex_no_message "$f" && return 0
+    artifact_is_failure_note "$f" && return 0
     artifact_is_transient_failure "$f"
 }
 

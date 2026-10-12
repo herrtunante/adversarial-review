@@ -42,7 +42,16 @@ SRC_FILES=200
 SRC_LINES=500
 
 # Always dropped, whatever the chunk: build output, vendored deps, VCS, tests.
-BASE_EXCLUDE='/target/|/node_modules/|/dist/|/build/|/[.]git/|/src/test/|/generated/|[.]min[.](js|css)$'
+# The directory names are matched below the module root only (see base_exclude):
+# matched anywhere in the absolute path, a module that itself lives under a
+# directory called "build" or "target" lost every one of its files.
+BASE_EXCLUDE_DIRS='target|node_modules|dist|build|[.]git|src/test|generated'
+BASE_EXCLUDE_FILES='[.]min[.](js|css)$'
+
+# State next to the scripts is global, so only one driver or wrapper may work in
+# this checkout at a time. See acquire_driver_lock.
+DRIVER_LOCK="$SCRIPT_DIR/.driver.lock"
+DRIVER_LOCK_HELD=0
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -163,6 +172,14 @@ resolve_includes() {
     return 0
 }
 
+# The always-on part of a chunk's exclusion regex, for one canonical module root.
+# Anchored at the module root, so only directories BELOW it are tested: the
+# regex is matched against absolute paths, and an unanchored "/build/" would
+# also match the directories the module itself sits in.
+base_exclude() {
+    printf '^%s/(.*/)?(%s)/|%s' "$(re_escape "$1")" "$BASE_EXCLUDE_DIRS" "$BASE_EXCLUDE_FILES"
+}
+
 # Build the exclusion regex that leaves only $includes visible under $module.
 #
 # filter_excluded uses `grep -Ev`, i.e. it can only subtract. To express "keep
@@ -180,20 +197,21 @@ build_exclude() {
     local module_abs="$1"
     shift
     local includes=() keep=() parts=() segs=()
-    local inc cur seg sub d is_kept parent
+    local inc cur seg sub d is_kept parent base
 
     module_abs="$(cd "$module_abs" 2>/dev/null && pwd)" || return 1
+    base="$(base_exclude "$module_abs")"
 
     for inc in "$@"; do
         inc="$(normalise_include "$inc")"
         if [[ -z "$inc" ]]; then
-            printf '%s' "$BASE_EXCLUDE"
+            printf '%s' "$base"
             return 0
         fi
         includes+=("$inc")
     done
     if [[ ${#includes[@]} -eq 0 ]]; then
-        printf '%s' "$BASE_EXCLUDE"
+        printf '%s' "$base"
         return 0
     fi
 
@@ -238,9 +256,9 @@ build_exclude() {
         joined="$(printf '%s\n' "${parts[@]}" | sort -u | paste -sd'|' -)"
     fi
     if [[ -n "$joined" ]]; then
-        printf '%s|%s' "$BASE_EXCLUDE" "$joined"
+        printf '%s|%s' "$base" "$joined"
     else
-        printf '%s' "$BASE_EXCLUDE"
+        printf '%s' "$base"
     fi
 }
 
@@ -248,16 +266,53 @@ build_exclude() {
 #
 # One awk pass over the whole file list rather than head+wc per file: spawning
 # two processes per source file costs minutes on Git Bash for a 1200-file tree.
+#
+# The selection has to be the collector's own (collect_source_code in
+# adversarial_review.sh), or --list plans a different review from the one that
+# runs: four separate walks (Java, Python, TS/JS, shell), each with its own find
+# filters, each sorted by path and only then cut to its cap. The run below hands
+# the collector SRC_FILES as the cap for all four and SRC_LINES as the line cap
+# for all four, so the same two numbers are used here. Counting one unsorted
+# combined list against a single cap, as this used to, could report a quarter of
+# the real dump and a different set of files.
+#
+# The find filters are tested against the path relative to the module, not the
+# absolute one: with the absolute path a module under a dot directory (a
+# worktree in ~/.claude/..., say) or under a directory called "target" or
+# "build" listed nothing at all. The exclude regex still sees absolute paths.
+#
+# One language's files, selected as the collector selects them. Arguments after
+# the first four are the find tests for that language.
+chunk_lang_files() {
+    local module_abs="$1" exclude="$2" label="$3" cap="$4"
+    shift 4
+    local list n
+    list="$( (cd "$module_abs" && find . "$@" -type f ! -path '*/.?*' 2>/dev/null) \
+             | sed 's|^\./||' \
+             | PREFIX="$module_abs/" awk '{ print ENVIRON["PREFIX"] $0 }' \
+             | { grep -Ev -- "$exclude" || true; } \
+             | sort || true)"
+    [[ -n "$list" ]] || return 0
+    n=$(printf '%s\n' "$list" | wc -l)
+    if (( n > cap )); then
+        warn "$label: $n files in scope but the cap is $cap - only the first $cap by path are reviewed (raise --max-files or split the chunk)" >&2
+    fi
+    printf '%s\n' "$list" | head -n "$cap" || true
+}
+
 chunk_stats() {
     local module_abs="$1"
     local exclude="$2"
-    find "$module_abs" \
-        \( -name '*.java' -o -name '*.py' -o -name '*.ts' -o -name '*.tsx' \
-           -o -name '*.js' -o -name '*.jsx' -o -name '*.sh' \) \
-        -type f ! -path '*/.*' 2>/dev/null \
-      | grep -Ev "$exclude" \
-      | head -n "$SRC_FILES" \
-      | awk -v maxlines="$SRC_LINES" '
+    {
+        chunk_lang_files "$module_abs" "$exclude" "Java" "$SRC_FILES" \
+            -name '*.java' ! -path '*/target/*' ! -path '*/build/*'
+        chunk_lang_files "$module_abs" "$exclude" "Python" "$SRC_FILES" \
+            -name '*.py' ! -path '*/__pycache__/*' ! -path '*/venv/*'
+        chunk_lang_files "$module_abs" "$exclude" "TS/JS" "$SRC_FILES" \
+            \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' \) ! -path '*/node_modules/*'
+        chunk_lang_files "$module_abs" "$exclude" "shell" "$SRC_FILES" \
+            -name '*.sh'
+    } | awk -v maxlines="$SRC_LINES" '
             # Read the file list on stdin and open each file ourselves, so the
             # whole chunk is measured by a single process regardless of how many
             # files it holds (xargs would split the list and print one line per
@@ -331,34 +386,242 @@ chunk_scope_is_intact() {
 # one most likely to meet an exhausted quota. When only that call failed, the six
 # that succeeded are still valid and the chunk can be finished with --from-phase 4
 # instead of being reviewed from scratch.
-chunk_debate_is_intact() {
-    local chunk_out="$1"
-    local f
+#
+# The test is on a directory holding the six files, so the same rules decide
+# both what is saved (a chunk's archived artifacts/) and what is picked up again
+# later (a .salvage-<id> directory). Three things are required:
+#
+# - all six files, each at least 200 bytes (verify_resume_artifacts' own floor);
+# - none of them a failed agent call of ANY kind. The transient test alone let a
+#   debate through in which Codex had timed out (its "no final message" note
+#   matches no quota pattern), and the chunk was then finished on one agent;
+# - scope.stamp, which adversarial_review.sh writes at the end of phase 1 and
+#   checks before it resumes. Without it nothing ties the six files to a target
+#   or to the source they were written about, and the review refuses anyway.
+debate_dir_is_intact() {
+    local dir="$1"
+    local f path
+    [[ -s "$dir/scope.stamp" ]] || return 1
     for f in iter1_1_claude_review.md iter1_1_codex_review.md \
              iter1_2_claude_on_codex.md iter1_2_codex_on_claude.md \
              iter1_3_claude_meta.md iter1_3_codex_meta.md; do
-        local path="$chunk_out/artifacts/$f"
+        path="$dir/$f"
         [[ -s "$path" ]] || return 1
         [[ $(wc -c < "$path") -ge 200 ]] || return 1
-        artifact_is_transient_failure "$path" && return 1
+        artifact_is_failed_call "$path" && return 1
     done
     return 0
 }
 
-# Block until the claude CLI answers a trivial prompt again, so a reset quota is
-# detected rather than guessed at from the message text.
-wait_for_claude() {
-    local max_waits="${1:-24}" interval="${2:-300}" i=1
-    while (( i <= max_waits )); do
-        if echo "Reply with exactly: OK" | timeout 120s claude --print 2>&1 | grep -qi '^OK'; then
-            ok "agent CLI is responding again"
+chunk_debate_is_intact() { debate_dir_is_intact "$1/artifacts"; }
+
+# Line 1 of a scope stamp is the canonical target the debate was written about.
+# Checked here so a saved debate left under a chunk id that now names another
+# module is dropped without spending the synthesis call on it. The source hash
+# on line 2 is the review's to check; it has the dump.
+stamp_names_target() {
+    local stamp="$1" target="$2" first=""
+    [[ -f "$stamp" ]] || return 1
+    IFS= read -r first < "$stamp" || true
+    first="${first%$'\r'}"
+    [[ "$first" == "$target" ]]
+}
+
+# Same choice as get_timeout_cmd in adversarial_review.sh: gtimeout where
+# coreutils is installed under that name (macOS), else timeout, else nothing.
+get_timeout_cmd() {
+    if command -v gtimeout > /dev/null 2>&1; then
+        echo "gtimeout"
+    elif command -v timeout > /dev/null 2>&1; then
+        echo "timeout"
+    else
+        echo ""
+    fi
+}
+
+# The codex binary the review itself would use (resolve_codex_bin in
+# adversarial_review.sh): a CODEX_BIN the user set and nothing else, otherwise
+# `codex` then `codex.cmd`, the first that answers --version. `command -v` is
+# not enough: on Windows the npm bash shim exists and does not run.
+PROBE_CODEX_BIN=""
+resolve_probe_codex_bin() {
+    local candidate
+    PROBE_CODEX_BIN=""
+    if [[ -n "${CODEX_BIN:-}" ]]; then
+        "$CODEX_BIN" --version > /dev/null 2>&1 || return 1
+        PROBE_CODEX_BIN="$CODEX_BIN"
+        return 0
+    fi
+    for candidate in codex codex.cmd; do
+        command -v "$candidate" > /dev/null 2>&1 || continue
+        if "$candidate" --version > /dev/null 2>&1; then
+            PROBE_CODEX_BIN="$candidate"
             return 0
         fi
-        warn "agent CLI still refusing (check $i/$max_waits), retrying in ${interval}s"
-        sleep "$interval"
+    done
+    return 1
+}
+
+# sleep that a trapped INT/TERM can interrupt: bash runs a trap only after the
+# foreground command returns, so a plain 5-minute sleep delays the stop by that.
+nap() {
+    sleep "$1" &
+    wait $! || true
+}
+
+probe_claude() {
+    local tcmd
+    tcmd="$(get_timeout_cmd)"
+    # $tcmd is deliberately unquoted: empty means "run without a time limit".
+    # shellcheck disable=SC2086
+    echo "Reply with exactly: OK" | ${tcmd:+$tcmd 120s} claude --print 2>&1 | grep -qi '^OK'
+}
+
+# One tiny `codex exec`, invoked the way run_codex invokes it. It counts as an
+# answer only if codex exits 0, leaves a final message, and neither the message
+# nor the transcript carries usage-limit or transport-error text: a refused
+# codex can still exit 0.
+probe_codex() {
+    local tcmd tmp_msg tmp_log tmp_dir rc=0
+    resolve_probe_codex_bin || return 1
+    tcmd="$(get_timeout_cmd)"
+    # Space-free paths, and a cwd that is not this repo: see run_codex.
+    tmp_dir="$(mktemp -d -t ar_probe_XXXXXX 2>/dev/null)" || tmp_dir=""
+    [[ -n "$tmp_dir" && -d "$tmp_dir" ]] || return 1
+    tmp_msg="$tmp_dir/msg"
+    tmp_log="$tmp_dir/log"
+    # shellcheck disable=SC2086
+    ( cd "$tmp_dir" && printf '%s' "Reply with exactly: OK" \
+        | ${tcmd:+$tcmd 120s} "$PROBE_CODEX_BIN" exec --sandbox read-only --skip-git-repo-check -o "$tmp_msg" - ) \
+        > "$tmp_log" 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        [[ -s "$tmp_msg" ]] || rc=1
+    fi
+    if [[ $rc -eq 0 ]] && grep -qEi -- "$TRANSIENT_SHORT_RE|$TRANSIENT_LOG_RE" "$tmp_msg" "$tmp_log" 2>/dev/null; then
+        rc=1
+    fi
+    rm -rf "$tmp_dir"
+    return $rc
+}
+
+# Block until BOTH agent CLIs answer a trivial prompt again, so a reset quota is
+# detected rather than guessed at from the message text. Probing Claude alone
+# returned at once whenever Codex was the refused one: the chunk was redone
+# straight away, failed the same way, and after three attempts every remaining
+# chunk went the same way.
+wait_for_agents() {
+    local max_waits="${1:-24}" interval="${2:-300}" i=1 down
+    while (( i <= max_waits )); do
+        down=""
+        probe_claude || down="claude"
+        probe_codex || down="${down:+$down and }codex"
+        if [[ -z "$down" ]]; then
+            ok "both agent CLIs are responding again"
+            return 0
+        fi
+        warn "agent CLI still refusing: $down (check $i/$max_waits), retrying in ${interval}s"
+        nap "$interval"
         i=$((i + 1))
     done
     return 1
+}
+
+# --- driver lock -------------------------------------------------------------
+#
+# .review.lock is held by adversarial_review.sh, so it is absent in the gap
+# between two chunks - exactly when this driver clears artifacts/ and when it
+# archives them. A second driver (or run_filelist_review.sh) starting in that gap
+# saw no lock and both then worked in the same artifacts/. This lock covers the
+# whole run instead: a DIRECTORY, because mkdir either creates it or fails, with
+# no window between the test and the write. The pid inside says who holds it.
+# adversarial_review.sh refuses to start under a live lock unless it was started
+# by the holder, which it learns from AR_DRIVER_LOCK_PID.
+acquire_driver_lock() {
+    local holder="" tries=0 took_over=0
+    while ! mkdir "$DRIVER_LOCK" 2>/dev/null; do
+        holder="$(cat "$DRIVER_LOCK/pid" 2>/dev/null | tr -d '\r\n ' || true)"
+        if [[ "$holder" =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null; then
+            err "another driver or wrapper is running in this checkout (pid $holder holds $DRIVER_LOCK)"
+            err "wait for it to finish, or use a separate git worktree; nothing was touched"
+            err "if no such run exists (see /proc, not ps), remove that directory and start again"
+            exit 4
+        fi
+        # No pid yet: the holder may be between its mkdir and its write. Give it
+        # a few seconds before calling the lock abandoned.
+        tries=$((tries + 1))
+        if [[ -z "$holder" && $tries -le 5 ]]; then
+            sleep 1
+            continue
+        fi
+        if (( tries > 10 )); then
+            err "cannot take $DRIVER_LOCK - remove it by hand if no run is alive"
+            exit 4
+        fi
+        warn "removing stale driver lock left by pid ${holder:-unknown}"
+        rm -rf "$DRIVER_LOCK"
+        took_over=1
+    done
+    # The directory can vanish between the mkdir and this write, when another
+    # process was already removing what it took for a stale lock.
+    if ! { echo $$ > "$DRIVER_LOCK/pid"; } 2>/dev/null; then
+        err "another driver removed $DRIVER_LOCK while it was being taken - nothing was touched"
+        exit 4
+    fi
+    DRIVER_LOCK_HELD=1
+    # Two processes can both find the same dead pid and both remove the lock; the
+    # second then deletes the first one's fresh lock. Look again after a moment
+    # and stand down if the pid inside is no longer ours.
+    if [[ $took_over -eq 1 ]]; then
+        sleep 1
+        holder="$(cat "$DRIVER_LOCK/pid" 2>/dev/null | tr -d '\r\n ' || true)"
+        if [[ "$holder" != "$$" ]]; then
+            DRIVER_LOCK_HELD=0
+            err "another driver took $DRIVER_LOCK at the same moment (pid ${holder:-unknown}) - nothing was touched"
+            exit 4
+        fi
+    fi
+    export AR_DRIVER_LOCK_PID=$$
+}
+
+release_driver_lock() {
+    [[ "$DRIVER_LOCK_HELD" == "1" ]] || return 0
+    DRIVER_LOCK_HELD=0
+    # Only our own: after a takeover race the directory may belong to someone else.
+    if [[ "$(cat "$DRIVER_LOCK/pid" 2>/dev/null | tr -d '\r\n ' || true)" == "$$" ]]; then
+        rm -rf "$DRIVER_LOCK"
+    fi
+    return 0
+}
+
+# Stop the review this driver started, if one is running. Its pid is in the lock
+# directory because the review runs on the left of a pipe into tee, in a
+# subshell, where $! is not visible from here. adversarial_review.sh traps TERM
+# itself, stops its agents and removes .review.lock.
+stop_child_review() {
+    local pid="" n=0
+    pid="$(cat "$DRIVER_LOCK/review.pid" 2>/dev/null | tr -d '\r\n ' || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && (( n < 20 )); do
+        sleep 1
+        n=$((n + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        warn "review pid $pid ignored TERM, killing it"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    return 0
+}
+
+on_driver_signal() {
+    local sig="$1" code="$2"
+    trap '' INT TERM
+    warn "received $sig - stopping the running review and releasing the driver lock"
+    if [[ "$DRIVER_LOCK_HELD" == "1" ]]; then
+        stop_child_review
+    fi
+    exit "$code"
 }
 
 # --- parse manifest ----------------------------------------------------------
@@ -442,6 +705,13 @@ else
 fi
 echo ""
 
+# Taken before the first clear of artifacts/ and held until the last chunk is
+# archived. --list never gets here, so planning works while a run is live.
+trap release_driver_lock EXIT
+trap 'on_driver_signal INT 130' INT
+trap 'on_driver_signal TERM 143' TERM
+acquire_driver_lock
+
 RUN_LOG="$OUT_DIR/run.log"
 INDEX="$OUT_DIR/index.tsv"
 [[ -f "$INDEX" ]] || printf "chunk_id\tfiles\tsize_kb\tstatus\titerations\tduration_s\n" > "$INDEX"
@@ -497,11 +767,21 @@ for i in "${!IDS[@]}"; do
   # A debate saved by an earlier run survives a restart of this driver (it lives
   # beside the chunk directory, not inside it). Pick it up so --resume finishes
   # the chunk with one synthesis call instead of repeating all seven.
+  #
+  # Only a debate that passes the same test it was saved under, and whose scope
+  # stamp names this chunk's module. One saved by an older driver has no stamp,
+  # and adversarial_review.sh would refuse to resume from it: discard it here and
+  # review the chunk in full.
   saved="$OUT_DIR/.salvage-$cid"
-  if [[ "$RESUME" == "1" && -d "$saved" ]]      && [[ $(find "$saved" -maxdepth 1 -name 'iter1_[123]_*.md' -size +199c | wc -l) -eq 6 ]]; then
-      salvage_dir="$saved"
-      resume_phase=4
-      info "$cid: found a saved debate from an earlier run - finishing with synthesis only"
+  if [[ "$RESUME" == "1" && -d "$saved" ]]; then
+      if debate_dir_is_intact "$saved" && stamp_names_target "$saved/scope.stamp" "$module_abs"; then
+          salvage_dir="$saved"
+          resume_phase=4
+          info "$cid: found a saved debate from an earlier run - finishing with synthesis only"
+      else
+          warn "$cid: saved debate is unusable (no scope stamp, another target, or a failed agent call) - reviewing the chunk in full"
+          rm -rf "$saved"
+      fi
   fi
   while true; do
     mkdir -p "$chunk_out"
@@ -515,7 +795,8 @@ for i in "${!IDS[@]}"; do
     # is the only thing preventing a second review from interleaving with a live
     # one in the shared artifacts/ directory. Clear the state directly and leave
     # the lock alone - and refuse to start the chunk at all while someone holds
-    # it, rather than trampling their run.
+    # it, rather than trampling their run. (.driver.lock, taken above, keeps out
+    # other drivers; this check is for a review someone started by hand.)
     if [[ -f "$SCRIPT_DIR/.review.lock" ]]; then
         holder="$(cat "$SCRIPT_DIR/.review.lock" 2>/dev/null || echo "")"
         if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
@@ -532,28 +813,50 @@ for i in "${!IDS[@]}"; do
 
     # A salvaged debate goes back into artifacts/ AFTER the clear above, so the
     # resumed run finds exactly the six files --from-phase 4 expects.
+    # The scope stamp goes with them: --from-phase refuses to resume without it.
     if [[ "$resume_phase" -gt 1 && -n "$salvage_dir" && -d "$salvage_dir" ]]; then
+        mkdir -p "$SCRIPT_DIR/artifacts" "$SCRIPT_DIR/logs"
         cp "$salvage_dir"/*.md "$SCRIPT_DIR/artifacts/" 2>/dev/null || true
+        cp "$salvage_dir"/scope.stamp "$SCRIPT_DIR/artifacts/" 2>/dev/null || true
         cp "$salvage_dir"/*.codex.log "$SCRIPT_DIR/logs/" 2>/dev/null || true
         info "$cid: restored saved debate, resuming at phase $resume_phase"
     fi
 
+    # Report-only is the review's default, and it is still said out loud: which
+    # of the two modes a chunk runs in must not depend on a default elsewhere.
     review_args=()
-    [[ "$FIX" == "1" ]] || review_args+=(--no-fix)
+    if [[ "$FIX" == "1" ]]; then
+        review_args+=(--fix)
+    else
+        review_args+=(--no-fix)
+    fi
     [[ "$DRY_RUN" == "1" ]] && review_args+=(--dry-run)
     [[ "$resume_phase" -gt 1 ]] && review_args+=(--from-phase "$resume_phase")
     review_args+=(-m "$MAX_ITERS" -t "$TIMEOUT_MIN" -v "$module_abs")
+    ran_from_phase="$resume_phase"
 
+    # The review runs in the background and is waited for: bash delivers a
+    # trapped TERM only once a foreground command has returned, so a foreground
+    # review would hold the stop back until the chunk was over. Its pid and exit
+    # code travel through the lock directory, which is ours for the whole run.
+    rm -f "$DRIVER_LOCK/review.pid" "$DRIVER_LOCK/review.rc"
     start=$(date +%s)
-    set +e
-    env MAX_SOURCE_FILES="$SRC_FILES" \
+    {
+        MAX_SOURCE_FILES="$SRC_FILES" \
         MAX_SOURCE_LINES="$SRC_LINES" \
         MAX_SOURCE_SHELL_FILES="$SRC_FILES" \
         MAX_SOURCE_SHELL_LINES="$SRC_LINES" \
         MAX_SOURCE_EXCLUDE="$exclude" \
-        "$REVIEW_SH" "${review_args[@]}" 2>&1 | tee "$chunk_out/console.log"
-    rc=${PIPESTATUS[0]}
-    set -e
+            "$REVIEW_SH" "${review_args[@]}" 2>&1 &
+        echo $! > "$DRIVER_LOCK/review.pid"
+        review_rc=0
+        wait $! || review_rc=$?
+        echo "$review_rc" > "$DRIVER_LOCK/review.rc"
+    } | tee "$chunk_out/console.log" &
+    wait $! || true
+    rc="$(cat "$DRIVER_LOCK/review.rc" 2>/dev/null | tr -d '\r\n ' || true)"
+    [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+    rm -f "$DRIVER_LOCK/review.pid" "$DRIVER_LOCK/review.rc"
     dur=$(($(date +%s) - start))
 
     # Archive everything this chunk produced before the next chunk wipes it.
@@ -564,29 +867,66 @@ for i in "${!IDS[@]}"; do
     # A quota refusal is not a review. Throw the chunk away, wait for the CLI to
     # answer again, and redo it - otherwise the loop races through every
     # remaining chunk producing empty artifacts that look like clean reviews.
-    if chunk_hit_transient_failure "$chunk_out" || ! chunk_scope_is_intact "$chunk_out" "$module_abs" "$exclude"; then
-        # Keep the debate if it survived and only synthesis was refused; that is
-        # six of the chunk's seven agent calls.
+    #
+    # Three reasons to redo a chunk, and only the first is worth waiting for:
+    #   transient    a quota or network failure - wait until both agents answer
+    #   scope        the artifacts came from another run - redo at once
+    #   failed call  an agent gave no answer for another reason (a Codex timeout
+    #                note, an empty artifact) - redo at once. chunk_is_reviewed
+    #                rejects such a chunk, so archiving it only handed the redo
+    #                to the next --resume.
+    # A fourth: a saved debate that adversarial_review.sh refused to resume from
+    # (its scope stamp no longer matches the target) is dropped and the chunk is
+    # reviewed in full.
+    redo=""
+    scope_ok=1
+    chunk_scope_is_intact "$chunk_out" "$module_abs" "$exclude" || scope_ok=0
+    if chunk_hit_transient_failure "$chunk_out"; then
+        redo="transient"
+    elif [[ $scope_ok -eq 0 ]]; then
+        redo="scope"
+    elif chunk_has_failed_call "$chunk_out"; then
+        redo="failed_call"
+    elif [[ "$ran_from_phase" -gt 1 && $rc -ne 0 \
+            && -z "$(latest_iter_artifact "$chunk_out/artifacts" 4_synthesis.md)" ]]; then
+        redo="stale_debate"
+    fi
+    if [[ -n "$redo" ]]; then
+        # Keep the debate if it survived and only synthesis failed; that is six
+        # of the chunk's seven agent calls.
         resume_phase=1
         salvage_dir=""
-        if chunk_scope_is_intact "$chunk_out" "$module_abs" "$exclude" \
+        rm -rf "$OUT_DIR/.salvage-$cid"
+        if [[ "$redo" != "stale_debate" && $scope_ok -eq 1 ]] \
            && chunk_debate_is_intact "$chunk_out"; then
             salvage_dir="$OUT_DIR/.salvage-$cid"
-            rm -rf "$salvage_dir"; mkdir -p "$salvage_dir"
+            mkdir -p "$salvage_dir"
             cp "$chunk_out"/artifacts/iter1_[123]_*.md "$salvage_dir/" 2>/dev/null || true
+            cp "$chunk_out"/artifacts/scope.stamp "$salvage_dir/" 2>/dev/null || true
             cp "$chunk_out"/logs/iter1_[123]_*.codex.log "$salvage_dir/" 2>/dev/null || true
             resume_phase=4
             warn "$cid: debate intact, only synthesis failed - keeping 6 of 7 calls"
         fi
-        warn "$cid: attempt $attempt/$max_attempts hit a quota or network failure, or was scope-contaminated - discarding"
+        case "$redo" in
+            transient)    warn "$cid: attempt $attempt/$max_attempts hit a quota or network failure - discarding" ;;
+            scope)        warn "$cid: attempt $attempt/$max_attempts was scope-contaminated - discarding" ;;
+            failed_call)  warn "$cid: attempt $attempt/$max_attempts has an agent call that produced no answer - discarding" ;;
+            stale_debate) warn "$cid: attempt $attempt/$max_attempts: the saved debate was not accepted (rc=$rc) - discarding it, reviewing in full" ;;
+        esac
         rm -rf "$chunk_out"
         if (( attempt >= max_attempts )); then
             err "$cid: still failing after $max_attempts attempts, giving up on this chunk"
-            printf "%s\t%s\t%s\ttransient_failure\t0\t0\n" "$cid" "$nf" "$kb" >> "$INDEX"
+            # The status says which kind, so a quota outage and a broken agent
+            # do not look alike in the index.
+            case "$redo" in
+                transient|scope) give_up="transient_failure" ;;
+                *)               give_up="agent_failure" ;;
+            esac
+            printf "%s\t%s\t%s\t%s\t0\t0\n" "$cid" "$nf" "$kb" "$give_up" >> "$INDEX"
             failed=$((failed + 1))
             break
         fi
-        if ! wait_for_claude; then
+        if [[ "$redo" == "transient" ]] && ! wait_for_agents; then
             err "agent CLI did not recover - stopping the run; resume with --resume"
             exit 3
         fi
@@ -629,8 +969,9 @@ if [[ -n "$ONLY_GLOB" && $selected -eq 0 ]]; then
 fi
 # Exit codes: 0 every selected chunk is reviewed (or was recorded as empty),
 # 1 bad arguments or manifest, 2 one or more chunks failed, 3 the agent CLI did
-# not recover, 4 another review holds the lock. supervise_review.sh still reads
-# the "run complete" line above, so that line is printed in both cases.
+# not recover, 4 another review holds .review.lock or another driver or wrapper
+# holds .driver.lock, 130/143 stopped by INT/TERM. supervise_review.sh still
+# reads the "run complete" line above, so that line is printed in both cases.
 if [[ $failed -gt 0 ]]; then
     warn "$failed chunk(s) failed - rerun with --resume to redo them"
     exit 2

@@ -1,5 +1,8 @@
 # State files (regenerated on run)
 tracking.json
+.review.lock
+.review.lock.recover/
+.driver.lock/
 .circuit_breaker.json
 .circuit_breaker_history.json
 .response_analysis.json

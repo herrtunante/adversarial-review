@@ -22,6 +22,7 @@
 #   --reset-circuit         Reset circuit breaker
 #   --circuit-status        Show circuit breaker status
 #   --dry-run               Show what would be done without executing
+#   --fix                   Let phase 4 modify the target (default: report only)
 
 set -euo pipefail
 
@@ -40,13 +41,25 @@ TRACKING_FILE="$AR_DIR/tracking.json"
 source "$LIB_DIR/date_utils.sh"
 source "$LIB_DIR/circuit_breaker.sh"
 source "$LIB_DIR/response_analyzer.sh"
+# Only for artifact_is_failure_note (verify_resume_artifacts). It defines
+# functions and patterns and runs nothing.
+source "$LIB_DIR/transient.sh"
 
 # Defaults
 MAX_ITERATIONS="${MAX_ITERATIONS:-3}"
 VERBOSE="${VERBOSE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 TIMEOUT_MINUTES="${TIMEOUT_MINUTES:-10}"
-NO_FIX="${NO_FIX:-0}"
+# Report-only is the default: phase 4 writes a report and changes nothing.
+# --fix (or NO_FIX=0) lets it edit the target. The synthesis prompt carries six
+# artifacts that quote the target's source, so a comment planted in reviewed
+# code reaches an agent that can write - fix mode is for trusted code only.
+NO_FIX="${NO_FIX:-1}"
+# The tools the phase-4 agent gets in fix mode. It can read and edit files and
+# nothing else: no shell, no network. This replaced
+# --dangerously-skip-permissions, which handed the same prompt every tool. It is
+# a tool allowlist, not filesystem containment.
+FIX_MODE_TOOLS="${FIX_MODE_TOOLS:-Read,Grep,Glob,Edit,Write}"
 # Start the first iteration at this phase instead of phase 1, reusing the
 # artifacts already in artifacts/. Only phase 4 is expensive to lose, so this
 # exists to recover a run whose debate succeeded and whose synthesis was refused.
@@ -108,9 +121,17 @@ get_timeout_cmd() {
 # On Windows/Git Bash the npm `codex` shell shim can resolve node to a placeholder
 # stub under node_modules/node ("This file intentionally left blank") while the .cmd
 # wrapper works fine. Probing with --version catches that; `command -v` does not.
+#
+# A CODEX_BIN set by the user is never replaced: it is probed the same way and
+# the run stops if it does not answer (return 2), instead of quietly reviewing
+# with a different binary than the one asked for.
 CODEX_BIN="${CODEX_BIN:-}"
 resolve_codex_bin() {
     local candidate
+    if [[ -n "$CODEX_BIN" ]]; then
+        "$CODEX_BIN" --version &> /dev/null && return 0
+        return 2
+    fi
     for candidate in codex codex.cmd; do
         command -v "$candidate" &> /dev/null || continue
         if "$candidate" --version &> /dev/null; then
@@ -137,7 +158,13 @@ check_dependencies() {
             missing+=("claude CLI is on PATH but fails to run - check 'claude --version'")
         fi
 
-        if ! command -v codex &> /dev/null && ! command -v codex.cmd &> /dev/null; then
+        if [[ -n "$CODEX_BIN" ]]; then
+            if resolve_codex_bin; then
+                log_verbose "Using codex binary from CODEX_BIN: $CODEX_BIN"
+            else
+                missing+=("CODEX_BIN is set to '$CODEX_BIN' but '$CODEX_BIN --version' fails - fix it or unset it")
+            fi
+        elif ! command -v codex &> /dev/null && ! command -v codex.cmd &> /dev/null; then
             missing+=("codex CLI (npm install -g @openai/codex)")
         elif ! resolve_codex_bin; then
             missing+=("codex CLI is on PATH but fails to run - check 'codex --version'")
@@ -385,6 +412,21 @@ filter_excluded() {
     fi
 }
 
+# find, with its path tests applied to the path RELATIVE to the target, printing
+# absolute paths. Run against the absolute path, `! -path "*/.*"` also matched
+# the target's own ancestors: a target under ~/.claude/worktrees/x, or under a
+# directory named target or build, yielded no files at all. Here find starts at
+# "." so only directories inside the target can match; "*/.?*" skips hidden
+# entries without matching that leading "./". The prefix is put back so
+# MAX_SOURCE_EXCLUDE still sees absolute paths (ENVIRON, not -v: awk -v would
+# interpret backslashes in the path).
+walk_target() {
+    local dir="$1"
+    shift
+    (cd "$dir" && find . "$@" 2>/dev/null) \
+        | AR_WALK_PREFIX="$dir/" awk '{ sub(/^\.\//, ""); print ENVIRON["AR_WALK_PREFIX"] $0 }'
+}
+
 # Collect source code from target directory
 collect_source_code() {
     local target_dir="$1"
@@ -434,7 +476,7 @@ collect_source_code() {
         local rel="${file#"$target_dir"/}"
         output+="$(dump_file "$rel" "$file" "$max_lines")"$'\n'
         count=$((count + 1))
-    done < <(find "$target_dir" -name "*.java" -type f ! -path "*/\.*" ! -path "*/target/*" ! -path "*/build/*" 2>/dev/null | filter_excluded | sort)
+    done < <(walk_target "$target_dir" -name "*.java" -type f ! -path "*/.?*" ! -path "*/target/*" ! -path "*/build/*" | filter_excluded | sort)
 
     # Python files
     count=0
@@ -443,7 +485,7 @@ collect_source_code() {
         local rel="${file#"$target_dir"/}"
         output+="$(dump_file "$rel" "$file" "$max_lines")"$'\n'
         count=$((count + 1))
-    done < <(find "$target_dir" -name "*.py" -type f ! -path "*/\.*" ! -path "*/__pycache__/*" ! -path "*/venv/*" ! -path "*/.venv/*" 2>/dev/null | filter_excluded | sort)
+    done < <(walk_target "$target_dir" -name "*.py" -type f ! -path "*/.?*" ! -path "*/__pycache__/*" ! -path "*/venv/*" | filter_excluded | sort)
 
     # TypeScript/JavaScript
     count=0
@@ -452,7 +494,7 @@ collect_source_code() {
         local rel="${file#"$target_dir"/}"
         output+="$(dump_file "$rel" "$file" "$max_lines")"$'\n'
         count=$((count + 1))
-    done < <(find "$target_dir" \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -type f ! -path "*/node_modules/*" ! -path "*/\.*" 2>/dev/null | filter_excluded | sort)
+    done < <(walk_target "$target_dir" \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -type f ! -path "*/node_modules/*" ! -path "*/.?*" | filter_excluded | sort)
 
     # Shell scripts
     count=0
@@ -461,7 +503,7 @@ collect_source_code() {
         local rel="${file#"$target_dir"/}"
         output+="$(dump_file "$rel" "$file" "$MAX_SOURCE_SHELL_LINES")"$'\n'
         count=$((count + 1))
-    done < <(find "$target_dir" -name "*.sh" -type f ! -path "*/\.*" 2>/dev/null | filter_excluded | sort)
+    done < <(walk_target "$target_dir" -name "*.sh" -type f ! -path "*/.?*" | filter_excluded | sort)
 
     echo "$output"
 }
@@ -484,14 +526,51 @@ run_claude() {
     local timeout_cmd=$(get_timeout_cmd)
     local timeout_secs=$((TIMEOUT_MINUTES * 60))
 
+    # Fix mode: the agent may read and edit files, and that is all. --tools
+    # removes every other built-in tool (no Bash at all, whatever the user's
+    # settings allow) and --allowedTools pre-approves the remaining ones, which
+    # --print needs because nobody is there to answer a permission prompt.
+    # Without either flag (every other call) a write is simply denied.
     local cmd_args=(--print)
-    [[ "$with_permissions" == "true" ]] && cmd_args+=(--dangerously-skip-permissions)
+    [[ "$with_permissions" == "true" ]] && cmd_args+=(--tools "$FIX_MODE_TOOLS" --allowedTools "$FIX_MODE_TOOLS")
+
+    # stderr goes to a log, not into the artifact: CLI warnings used to become
+    # review text and were handed to the next phase as if the agent had said them.
+    local claude_log="$LOGS_DIR/$(basename "${output_file%.md}").claude.log"
+    mkdir -p "$LOGS_DIR"
 
     local exit_code=0
     if [[ -n "$timeout_cmd" ]]; then
-        (cd "$working_dir" && echo "$prompt" | $timeout_cmd ${timeout_secs}s claude "${cmd_args[@]}") > "$output_file" 2>&1 || exit_code=$?
+        (cd "$working_dir" && echo "$prompt" | $timeout_cmd ${timeout_secs}s claude "${cmd_args[@]}") > "$output_file" 2> "$claude_log" || exit_code=$?
     else
-        (cd "$working_dir" && echo "$prompt" | claude "${cmd_args[@]}") > "$output_file" 2>&1 || exit_code=$?
+        (cd "$working_dir" && echo "$prompt" | claude "${cmd_args[@]}") > "$output_file" 2> "$claude_log" || exit_code=$?
+    fi
+
+    # A failed or silent call must stay recognisable now that stderr is no
+    # longer in the artifact, wherever the CLI printed its refusal. Same shape
+    # as run_codex's note: lib/transient.sh reads the first line to tell a
+    # failed call from a review, and the quoted lines to tell a quota or network
+    # failure (worth waiting out) from any other. Whatever the call did print is
+    # moved to the log, so nothing is lost and a half-written review cannot be
+    # parsed as a finished one.
+    if [[ $exit_code -ne 0 || ! -s "$output_file" ]]; then
+        log_warning "Claude produced no usable output; recording the failure (output kept in $claude_log)"
+        {
+            echo
+            echo "--- stdout of the failed call (exit code $exit_code) ---"
+            cat "$output_file" 2>/dev/null
+        } >> "$claude_log"
+        {
+            echo "CLAUDE PRODUCED NO OUTPUT (exit code $exit_code)"
+            echo
+            echo "Matching lines from its output $claude_log :"
+            # Wider than run_codex's list: Claude's own refusal reads "You've hit
+            # your session limit", which none of those words matches, and the
+            # network failures name an errno. Lines are cut so the note stays
+            # under TRANSIENT_SHORT_MAX_BYTES.
+            grep -aiE "error|limit|quota|refus|timed out|overloaded|resets [0-9]|reach the API|ENOTFOUND|EAI_AGAIN|ECONN|ETIMEDOUT|disconnected" "$claude_log" 2>/dev/null | tail -n 5 | cut -c 1-240
+        } > "$output_file"
+        [[ $exit_code -eq 0 ]] && exit_code=1
     fi
 
     if [[ $exit_code -eq 0 ]]; then
@@ -658,25 +737,66 @@ wait_for_agents() {
 # disabled the circuit breaker's same-issues trigger. Fingerprinting the set of
 # referenced source locations is stable across rewordings; line numbers are
 # stripped because they shift as fixes are applied.
+#
+# The extension is anchored with \b: without it "config.json" matched as
+# "config.js". An empty path set prints nothing rather than the hash of nothing,
+# which was the same value every time and so counted two reviews that named no
+# file as "the same issues"; record_iteration_result skips an empty hash.
 issues_fingerprint() {
-    cat "$@" 2>/dev/null \
-        | grep -oiE '[A-Za-z0-9_./-]+\.(py|ts|tsx|js|jsx|sh|go|rs|java|rb|c|h|cpp|hpp|cs|php|swift|kt)(:[0-9]+)?' \
+    local paths
+    paths=$(cat "$@" 2>/dev/null \
+        | grep -oiE '[A-Za-z0-9_./-]+\.(py|ts|tsx|js|jsx|sh|go|rs|java|rb|c|h|cpp|hpp|cs|php|swift|kt)(:[0-9]+)?\b' \
         | sed 's/:[0-9]*$//' \
         | tr '[:upper:]' '[:lower:]' \
-        | sort -u \
-        | sha256_hash
+        | sort -u || true)
+    if [[ -n "$paths" ]]; then
+        printf '%s\n' "$paths" | sha256_hash
+    fi
 }
 
-# Hash of the target's working-tree state, used to detect whether phase 4
-# actually changed anything rather than trusting the agent's self-report.
-# Echoes "no-git" when the target is not a git repository.
+# Hash of the target's state, used to detect whether phase 4 actually changed
+# anything rather than trusting the agent's self-report. Echoes "no-git" when
+# the target is not a git repository.
+#
+# HEAD is part of it because an agent that commits its own work leaves a clean
+# status and empty diffs, which read as "nothing changed". Untracked files are
+# hashed by content because `status` only lists their names: an edit to a file
+# that was already untracked changed nothing here. That costs one read of every
+# untracked, non-ignored file under the target, twice per iteration.
 target_state_hash() {
     local dir="$1"
     if git -C "$dir" rev-parse --git-dir &> /dev/null; then
-        { git -C "$dir" status --porcelain; git -C "$dir" diff; git -C "$dir" diff --cached; } 2>/dev/null | sha256_hash
+        {
+            git -C "$dir" rev-parse HEAD || true
+            git -C "$dir" status --porcelain
+            git -C "$dir" diff
+            git -C "$dir" diff --cached
+            (cd "$dir" && git ls-files -z --others --exclude-standard | xargs -0 -r cksum) || true
+        } 2>/dev/null | sha256_hash
     else
         echo "no-git"
     fi
+}
+
+# What a debate was about: the canonical target path and a hash of the source
+# dump its phase 1 was given. Written at the end of phase 1 and checked by
+# verify_resume_artifacts, because the artifact names (iter1_...) say nothing
+# about either - a debate left by another target, another chunk or an older
+# state of the code was otherwise resumed as if it were this one. Not a .md
+# file on purpose: everything that loops over artifacts/*.md ignores it.
+SCOPE_STAMP_FILE="$ARTIFACTS_DIR/scope.stamp"
+
+source_dump_hash() {
+    printf '%s' "$1" | sha256_hash
+}
+
+write_scope_stamp() {
+    local target_dir="$1"
+    local source_code="$2"
+    {
+        printf '%s\n' "$target_dir"
+        source_dump_hash "$source_code"
+    } > "$SCOPE_STAMP_FILE.tmp" && mv "$SCOPE_STAMP_FILE.tmp" "$SCOPE_STAMP_FILE"
 }
 
 # CONSENSUS_REACHED is coerced by parse_status_block: YES becomes boolean true,
@@ -740,6 +860,9 @@ $source_code
     if ! wait_for_agents "$claude_pid" "$codex_pid" "phase 1"; then
         return 2  # Both agents dead - caller aborts the iteration
     fi
+
+    # Record what this debate is about, for a later --from-phase.
+    write_scope_stamp "$target_dir" "$source_code"
 
     # Parse results
     local claude_status=$(parse_status_block "$claude_out" "REVIEW_STATUS")
@@ -923,9 +1046,30 @@ run_phase_4() {
     local target_dir="$1"
     local iteration="$2"
 
-    log_info "=== Phase 4: Synthesis & Implementation ==="
+    if [[ "$NO_FIX" == "1" ]]; then
+        log_info "=== Phase 4: Synthesis (report only - the target is not modified) ==="
+    else
+        log_info "=== Phase 4: Synthesis & Implementation (--fix: the agent may edit files in $target_dir) ==="
+        log_warning "Fix mode gives the agent write access to the target (tools: $FIX_MODE_TOOLS). Use it on trusted code only."
+    fi
 
     local synthesis_prompt=$(cat "$PROMPTS_DIR/synthesis.md")
+
+    # Fix mode has file tools only. The template asks for tests to be run, which
+    # needs a shell the agent does not have; say so rather than let it report
+    # tests it could not have run.
+    if [[ "$NO_FIX" != "1" ]]; then
+        synthesis_prompt="# TOOLS AVAILABLE IN THIS RUN
+
+You can read, search, edit and create files ($FIX_MODE_TOOLS). You have no
+shell: you cannot run tests, builds or git. Where the instructions below say to
+test a change, check it by reading the code instead, and report TESTS_RUN: NO
+and TESTS_PASSING: N/A in the status block.
+
+---
+
+$synthesis_prompt"
+    fi
 
     # Report-only mode. The override goes FIRST so it is read before the
     # implementation instructions it countermands, and the agent is additionally
@@ -991,7 +1135,7 @@ Working directory: $target_dir
     # ground truth rather than the agent's self-report.
     local state_before=$(target_state_hash "$target_dir")
 
-    # Report-only mode also withholds --dangerously-skip-permissions, so the
+    # Report-only mode also withholds the edit tools (see run_claude), so the
     # prompt override is backed by an actual permission boundary.
     local allow_writes="true"
     [[ "$NO_FIX" == "1" ]] && allow_writes="false"
@@ -1006,7 +1150,11 @@ Working directory: $target_dir
     wait "$synth_pid" || synth_rc=$?
     AGENT_PIDS=()
     if [[ $synth_rc -ne 0 ]]; then
-        log_error "Synthesis agent failed ($(describe_exit $synth_rc)) - no fixes applied this iteration"
+        if [[ "$NO_FIX" == "1" ]]; then
+            log_error "Synthesis agent failed ($(describe_exit $synth_rc)) - no report was written"
+        else
+            log_error "Synthesis agent failed ($(describe_exit $synth_rc)) - it may have edited some files before failing; check the target"
+        fi
     fi
 
     local state_after=$(target_state_hash "$target_dir")
@@ -1021,7 +1169,9 @@ Working directory: $target_dir
     # than a real stall. Fall back to the self-report only for non-git targets.
     local fixes_made=0
     if [[ "$state_before" == "no-git" ]]; then
-        log_warning "Target is not a git repository - falling back to self-reported FILES_MODIFIED"
+        if [[ "$NO_FIX" != "1" ]]; then
+            log_warning "Target is not a git repository - falling back to self-reported FILES_MODIFIED"
+        fi
         fixes_made="$reported_modified"
     else
         if [[ "$state_before" != "$state_after" ]]; then
@@ -1038,7 +1188,10 @@ Working directory: $target_dir
     # would re-review byte-identical code, and feeding a guaranteed zero-progress
     # result to the circuit breaker would leave it dirty for the next real run.
     if [[ "$NO_FIX" == "1" ]]; then
-        if [[ "$state_before" != "$state_after" ]]; then
+        if [[ "$state_before" == "no-git" ]]; then
+            # Two identical "no-git" sentinels prove nothing about the files.
+            log_warning "Report-only: cannot verify the target is untouched (not a git repository)"
+        elif [[ "$state_before" != "$state_after" ]]; then
             log_error "Report-only mode but the target changed - inspect 'git status' in the target"
         else
             log_success "Report-only: target untouched"
@@ -1091,7 +1244,11 @@ Working directory: $target_dir
         return 0
     fi
 
-    log_info "Fixes applied, will verify in next iteration"
+    if [[ "$fixes_made" -gt 0 ]]; then
+        log_info "Fixes applied, will verify in next iteration"
+    else
+        log_info "No change to the target this iteration; reviewing again"
+    fi
     return 1
 }
 
@@ -1191,25 +1348,95 @@ on_signal() {
     exit "$code"
 }
 
+# Create the lock only if it does not exist. noclobber makes the shell open the
+# file with O_EXCL, so of two reviews started in the same instant exactly one
+# succeeds. The old "test -f, then echo" let both through.
+write_lock() {
+    ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null
+}
+
+read_lock_holder() {
+    tr -d '[:space:]' < "$LOCK_FILE" 2>/dev/null || true
+}
+
 acquire_lock() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        local holder
-        holder=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+    if ! write_lock; then
+        # The lock exists. An empty one may be a lock another review is writing
+        # at this very moment (created, pid not in it yet): give it a moment
+        # before calling it stale.
+        local holder="" tries=0
+        while [[ $tries -lt 10 ]]; do
+            holder=$(read_lock_holder)
+            [[ -n "$holder" || ! -e "$LOCK_FILE" ]] && break
+            sleep 0.2
+            tries=$((tries + 1))
+        done
         if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
             log_error "A review is already running (pid $holder)"
             log_error "Concurrent runs corrupt each other's artifacts. Wait for it to"
             log_error "finish, or kill it and remove $LOCK_FILE"
             exit 1
         fi
+
+        # Stale: its owner is dead. Clearing it is the one step noclobber cannot
+        # make safe, since two reviews could each remove "the stale lock" and the
+        # second would delete the first one's fresh lock. mkdir is atomic, so
+        # only one of them gets to clear it, and it re-reads the lock first in
+        # case another review replaced it in between.
+        if ! mkdir "$LOCK_FILE.recover" 2>/dev/null; then
+            log_error "Another review is clearing a stale lock right now - try again in a moment"
+            log_error "(if no review is running, remove the directory $LOCK_FILE.recover)"
+            exit 1
+        fi
+        if [[ "$(read_lock_holder)" != "$holder" ]]; then
+            rmdir "$LOCK_FILE.recover" 2>/dev/null || true
+            log_error "Another review took $LOCK_FILE first"
+            exit 1
+        fi
         log_warning "Removing stale lock left by pid ${holder:-unknown}"
         rm -f "$LOCK_FILE"
+        if ! write_lock; then
+            rmdir "$LOCK_FILE.recover" 2>/dev/null || true
+            log_error "Another review took $LOCK_FILE first"
+            exit 1
+        fi
+        rmdir "$LOCK_FILE.recover" 2>/dev/null || true
     fi
 
-    echo $$ > "$LOCK_FILE"
     LOCK_OWNER_PID="$BASHPID"
     trap release_lock EXIT
     trap 'on_signal INT 130' INT
     trap 'on_signal TERM 143' TERM
+}
+
+# The chunk drivers hold a second lock for their whole run: the directory
+# .driver.lock, with the driver's pid in the file "pid". The review lock above
+# is not enough for them, because it is free in the gap between two chunks while
+# the driver is clearing or archiving artifacts/. A review the driver starts
+# itself is recognised by AR_DRIVER_LOCK_PID, which the driver exports, or by
+# being its direct child. A lock whose pid is dead is stale and blocks nothing;
+# it is left for the next driver to clean up.
+DRIVER_LOCK_DIR="$AR_DIR/.driver.lock"
+
+# Print the pid of the live driver holding the lock; return 1 when there is none.
+live_driver_pid() {
+    local pid
+    [[ -f "$DRIVER_LOCK_DIR/pid" ]] || return 1
+    pid=$(tr -d '[:space:]' < "$DRIVER_LOCK_DIR/pid" 2>/dev/null || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+refuse_foreign_driver() {
+    local pid
+    pid=$(live_driver_pid) || return 0
+    [[ "$pid" == "${AR_DRIVER_LOCK_PID:-}" || "$pid" == "$PPID" ]] && return 0
+    log_error "A chunk driver is running here (pid $pid holds $DRIVER_LOCK_DIR)"
+    log_error "It clears and archives artifacts/ between its chunks, so a review started"
+    log_error "now would be mixed into its output. Wait for it to finish, or run this"
+    log_error "review from a separate git worktree."
+    exit 1
 }
 
 # A --dry-run writes stub artifacts to the same paths as a real run, so starting
@@ -1234,8 +1461,14 @@ guard_existing_artifacts() {
 # Phases talk to each other only through artifact files, so starting mid-run is
 # safe exactly when the earlier phases' artifacts are present and real. Check
 # that here rather than letting a phase read a missing file and review nothing.
+#
+# Present is not enough: the files must also belong to THIS target and THIS
+# source. scope.stamp (written by phase 1) is compared with the target path and
+# with a hash of the dump collected now; a missing stamp is refused as well,
+# since nothing then says what the debate was about.
 verify_resume_artifacts() {
     local from="$1"
+    local target_dir="$2"
     local missing=()
     local required=()
 
@@ -1247,16 +1480,48 @@ verify_resume_artifacts() {
     for f in "${required[@]}"; do
         # 200 bytes is well under any real review and well over a one-line
         # refusal such as "You have hit your session limit".
-        if [[ ! -s "$ARTIFACTS_DIR/$f" ]] || [[ $(wc -c < "$ARTIFACTS_DIR/$f") -lt 200 ]]; then
+        # The note run_claude/run_codex leave for a failed call is longer than
+        # that and is no review either.
+        if [[ ! -s "$ARTIFACTS_DIR/$f" ]] || [[ $(wc -c < "$ARTIFACTS_DIR/$f") -lt 200 ]] \
+           || artifact_is_failure_note "$ARTIFACTS_DIR/$f"; then
             missing+=("$f")
         fi
     done
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "--from-phase $from needs earlier artifacts that are missing or empty:"
+        log_error "--from-phase $from needs earlier artifacts that are missing, empty or a failed agent call:"
         for f in "${missing[@]}"; do log_error "  $ARTIFACTS_DIR/$f"; done
         return 1
     fi
+
+    if [[ ! -s "$SCOPE_STAMP_FILE" ]]; then
+        log_error "--from-phase $from: $SCOPE_STAMP_FILE is missing, so nothing says which target"
+        log_error "and source the artifacts in $ARTIFACTS_DIR belong to. Run the review from phase 1."
+        return 1
+    fi
+    local stamp_target stamp_hash source_code now_hash
+    stamp_target=$(sed -n '1p' "$SCOPE_STAMP_FILE" | tr -d '\r')
+    stamp_hash=$(sed -n '2p' "$SCOPE_STAMP_FILE" | tr -d '\r[:space:]')
+    if [[ "$stamp_target" != "$target_dir" ]]; then
+        log_error "--from-phase $from: the artifacts are from a different target"
+        log_error "  debated:   $stamp_target"
+        log_error "  this run:  $target_dir"
+        return 1
+    fi
+    if ! source_code=$(collect_source_code "$target_dir"); then
+        log_error "--from-phase $from: source collection failed, cannot check the artifacts against it"
+        return 1
+    fi
+    now_hash=$(source_dump_hash "$source_code")
+    if [[ "$stamp_hash" != "$now_hash" ]]; then
+        log_error "--from-phase $from: the source in scope differs from what was debated"
+        log_error "(same target, but a file changed or the scope settings are not the same:"
+        log_error "MAX_SOURCE_*, SOURCE_FILE_LIST, --changed-only). Run the review from phase 1."
+        log_error "  debated:   $stamp_hash"
+        log_error "  this run:  $now_hash"
+        return 1
+    fi
+
     log_info "Resuming at phase $from using ${#required[@]} existing artifact(s)"
     return 0
 }
@@ -1265,11 +1530,18 @@ run_review_loop() {
     local target_dir="$1"
     target_dir="$(cd "$target_dir" && pwd)"
 
+    # Checked on both sides of taking the review lock. Before, so a review that
+    # must not start never holds the lock, not even for a moment in which the
+    # driver's own next chunk would find it taken. After, because the driver
+    # works the other way round (takes its lock, then looks for ours): whichever
+    # of the two started second is then certain to see the other.
+    refuse_foreign_driver
     guard_existing_artifacts
     acquire_lock
+    refuse_foreign_driver
 
     if [[ "$FROM_PHASE" -gt 1 ]]; then
-        verify_resume_artifacts "$FROM_PHASE" || return 1
+        verify_resume_artifacts "$FROM_PHASE" "$target_dir" || return 1
     fi
 
     log_info "Starting Adversarial Review Loop"
@@ -1282,6 +1554,26 @@ run_review_loop() {
     init_tracking
     log_verbose "Initializing circuit breaker..."
     init_circuit_breaker
+
+    # The breaker's counters and its last issue fingerprint describe the target
+    # they were counted on. Carried over to another target they open the breaker
+    # for stalls that happened somewhere else. The previous target has to be
+    # read here, before it is overwritten. OPEN stays terminal either way.
+    #
+    # The comparison is done inside jq, with the new path passed the same way
+    # update_tracking passes it. On Git Bash jq is a native program and MSYS
+    # rewrites a path argument (/c/x becomes C:/x), so the stored value never
+    # equals the shell's own $target_dir and a bash comparison saw a "changed"
+    # target on every run.
+    local previous_target
+    previous_target=$(jq -r --arg t "$target_dir" \
+        'if (.target_dir // "") == "" or .target_dir == $t then "" else .target_dir end' \
+        "$TRACKING_FILE" 2>/dev/null | tr -d '\r' || true)
+    if [[ -n "$previous_target" ]]; then
+        if reset_circuit_counters; then
+            log_info "Target changed since the last run ($previous_target) - circuit breaker counters reset"
+        fi
+    fi
 
     log_verbose "Updating tracking state..."
     update_tracking "target_dir" "$target_dir"
@@ -1450,8 +1742,18 @@ reset_all() {
             exit 1
         fi
     fi
+    # Same for a chunk driver, whoever started this: between two chunks it holds
+    # no review lock, and artifacts/ is still its working directory.
+    local driver_pid
+    if driver_pid=$(live_driver_pid); then
+        log_error "A chunk driver is running (pid $driver_pid holds $DRIVER_LOCK_DIR) - refusing to reset its state"
+        log_error "Wait for it to finish, or kill it first"
+        exit 1
+    fi
 
     log_info "Resetting all state..."
+    rmdir "$LOCK_FILE.recover" 2>/dev/null || true
+    # artifacts/* includes scope.stamp.
     rm -rf "$ARTIFACTS_DIR"/* "$TRACKING_FILE"
     rm -f "$AR_DIR/.circuit_breaker.json" "$AR_DIR/.circuit_breaker_history.json"
     rm -f "$AR_DIR/.response_analysis.json" "$AR_DIR/.review.lock"
@@ -1480,11 +1782,25 @@ OPTIONS:
     --reset-circuit         Reset circuit breaker only
     --circuit-status        Show circuit breaker status
     --dry-run               Show what would happen without executing
-    --no-fix                Review only: phase 4 writes a report and modifies
-                            nothing. Runs a single iteration.
+    --fix                   Let phase 4 implement the agreed fixes in the target.
+                            WITHOUT this flag the run is report-only: phase 4
+                            writes a report, modifies nothing, and the run is a
+                            single iteration.
+                            Fix mode gives the agent write access to the target:
+                            it can read, edit and create files there (tools:
+                            Read, Grep, Glob, Edit, Write; no shell, so it
+                            cannot run tests). The prompt it acts on quotes the
+                            reviewed source, so text planted in that source can
+                            steer it. Use --fix only on code you trust, and
+                            commit the target first. The tool list is an
+                            allowlist, not a sandbox.
+    --no-fix                Report only. This is the default; the flag is kept
+                            for existing command lines.
     --from-phase N          Start the first iteration at phase N (1-4), reusing
                             the artifacts already in artifacts/. Use it to redo
                             only a failed synthesis without repeating the debate.
+                            Refused unless artifacts/scope.stamp shows they were
+                            made for this target and this exact source.
     --changed-only          Review only files with uncommitted git changes,
                             included in full rather than truncated.
 
@@ -1492,13 +1808,25 @@ PHASES:
     1. Independent Review   Claude and Codex review code in parallel
     2. Cross-Review         Each reviews the other's findings
     3. Meta-Review          Each reviews feedback on their review
-    4. Synthesis            Claude synthesizes and implements fixes
+    4. Synthesis            Claude weighs the debate and writes the report;
+                            with --fix it also implements the fixes
+
+ENVIRONMENT:
+    MAX_ITERATIONS, TIMEOUT_MINUTES, VERBOSE=1, DRY_RUN=1 mirror the flags.
+    NO_FIX=0                Same as --fix (NO_FIX=1, the default, is report-only)
+    FROM_PHASE=N            Same as --from-phase N
+    CODEX_BIN=path          Use this codex binary; the run stops if it does not
+                            answer --version
+    FIX_MODE_TOOLS=list     Tools the agent gets with --fix
+                            (default: Read,Grep,Glob,Edit,Write)
 
 CIRCUIT BREAKER:
     Prevents runaway loops by detecting:
     - No progress after 3 iterations
     - Persistent disagreement (5+ iterations)
     - Same issues found 3+ times (unfixable)
+    It only counts in fix mode. Its counters start again when the target is
+    not the one of the previous run; an OPEN breaker needs --reset-circuit.
 
 REQUIREMENTS:
     - claude CLI: npm install -g @anthropic-ai/claude-code
@@ -1507,8 +1835,8 @@ REQUIREMENTS:
     - coreutils (macOS): brew install coreutils (for timeout)
 
 EXAMPLES:
-    ./adversarial_review.sh ../my-project
-    ./adversarial_review.sh -m 5 -v ../my-project
+    ./adversarial_review.sh ../my-project              # report only
+    ./adversarial_review.sh --fix -m 5 -v ../my-project
     ./adversarial_review.sh --dry-run ../my-project
     ./adversarial_review.sh --status
 
@@ -1518,6 +1846,15 @@ EOF
 # ============================================================================
 # Main Entry Point
 # ============================================================================
+# A flag that takes a value, given as the last word, used to die under `set -u`
+# with "$2: unbound variable" and no hint of which flag was at fault.
+need_arg() {
+    if [[ $# -lt 2 ]]; then
+        log_error "$1 needs a value"
+        exit 1
+    fi
+}
+
 main() {
     local target_dir=""
     local custom_prompt=""
@@ -1529,10 +1866,12 @@ main() {
                 exit 0
                 ;;
             -m|--max-iters)
+                need_arg "$@"
                 MAX_ITERATIONS="$2"
                 shift 2
                 ;;
             -p|--prompt)
+                need_arg "$@"
                 custom_prompt="$2"
                 shift 2
                 ;;
@@ -1541,6 +1880,7 @@ main() {
                 shift
                 ;;
             -t|--timeout)
+                need_arg "$@"
                 TIMEOUT_MINUTES="$2"
                 shift 2
                 ;;
@@ -1566,11 +1906,16 @@ main() {
                 DRY_RUN=1
                 shift
                 ;;
+            --fix)
+                NO_FIX=0
+                shift
+                ;;
             --no-fix)
                 NO_FIX=1
                 shift
                 ;;
             --from-phase)
+                need_arg "$@"
                 FROM_PHASE="$2"
                 if ! [[ "$FROM_PHASE" =~ ^[1-4]$ ]]; then
                     log_error "--from-phase takes 1, 2, 3 or 4"
@@ -1603,6 +1948,28 @@ main() {
 
     if [[ ! -d "$target_dir" ]]; then
         log_error "Directory does not exist: $target_dir"
+        exit 1
+    fi
+
+    # Checked after the loop so values from the environment are held to the same
+    # rule as the flags. None of these was checked: -m 0 ended at once as "max
+    # iterations", a non-numeric -t broke the timeout arithmetic in the middle
+    # of phase 1, and FROM_PHASE from the environment bypassed the check that
+    # --from-phase gets.
+    if ! [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "-m/--max-iters (MAX_ITERATIONS) must be a positive integer, got '$MAX_ITERATIONS'"
+        exit 1
+    fi
+    if ! [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "-t/--timeout (TIMEOUT_MINUTES) must be a positive integer, got '$TIMEOUT_MINUTES'"
+        exit 1
+    fi
+    if ! [[ "$FROM_PHASE" =~ ^[1-4]$ ]]; then
+        log_error "--from-phase (FROM_PHASE) must be 1, 2, 3 or 4, got '$FROM_PHASE'"
+        exit 1
+    fi
+    if [[ "$NO_FIX" != "0" && "$NO_FIX" != "1" ]]; then
+        log_error "NO_FIX must be 0 (fix mode) or 1 (report only), got '$NO_FIX'"
         exit 1
     fi
 

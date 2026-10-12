@@ -258,6 +258,30 @@ show_circuit_status() {
     echo -e "Total opens:        $total_opens"
 }
 
+# Forget what was counted, without touching an OPEN breaker.
+# Called at the start of a run on a different target than the previous one: the
+# consecutive counters and the last issue fingerprint belong to the code they
+# were counted on. HALF_OPEN goes back to CLOSED, since it is only a summary of
+# those counters. OPEN is terminal and is left exactly as it is (returns 1);
+# total_opens and the history file are kept.
+reset_circuit_counters() {
+    init_circuit_breaker
+
+    [[ "$(get_circuit_state)" != "$CB_STATE_OPEN" ]] || return 1
+
+    local tmp="$CB_STATE_FILE.tmp"
+    jq --arg state "$CB_STATE_CLOSED" --arg ts "$(get_iso_timestamp)" '
+        .state = $state
+        | .last_change = $ts
+        | .consecutive_no_progress = 0
+        | .consecutive_disagreement = 0
+        | .consecutive_same_issues = 0
+        | .last_progress_iteration = 0
+        | .reason = ""
+        | .last_issues_hash = ""
+    ' "$CB_STATE_FILE" > "$tmp" && mv "$tmp" "$CB_STATE_FILE"
+}
+
 # Reset circuit breaker
 reset_circuit_breaker() {
     local reason=${1:-"Manual reset"}
@@ -272,4 +296,5 @@ export -f get_circuit_state
 export -f can_execute
 export -f record_iteration_result
 export -f show_circuit_status
+export -f reset_circuit_counters
 export -f reset_circuit_breaker

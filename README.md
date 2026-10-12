@@ -35,11 +35,11 @@ Two AI agents (Claude and GPT Codex) independently review code, then critique ea
 │  Phase 4: Synthesis                                         │
 │    Claude reviews all debate artifacts                      │
 │    Decides which issues are valid                           │
-│    Implements fixes with high/medium confidence             │
+│    Reports the agreed fixes; implements them with --fix     │
 └─────────────────────────────────────────────────────────────┘
                             │
                             ▼
-              Loop back to Phase 1 to verify fixes
+        With --fix: loop back to Phase 1 to verify fixes
               until both agents report NO_ISSUES
 ```
 
@@ -91,8 +91,11 @@ OPTIONS:
     --reset-circuit         Reset circuit breaker only
     --circuit-status        Show circuit breaker status
     --dry-run               Show what would happen without executing
-    --no-fix                Review only: phase 4 writes a report and modifies
-                            nothing. Runs a single iteration.
+    --fix                   Let Claude implement the agreed fixes in the target.
+                            Without it the run is report-only (the default):
+                            phase 4 writes a report and modifies nothing, in
+                            a single iteration. Use only on code you trust.
+    --no-fix                Accepted for compatibility; report-only is the default.
     --from-phase N          Start the first iteration at phase N (1-4), reusing
                             the artifacts already in artifacts/
     --changed-only          Review only files with uncommitted git changes,
@@ -157,6 +160,8 @@ MAX_ITERATIONS=5      # Override max iterations
 TIMEOUT_MINUTES=15    # Timeout per agent call
 VERBOSE=1             # Enable verbose output
 DRY_RUN=1            # Show what would happen
+NO_FIX=0             # Same as --fix
+CODEX_BIN=codex.cmd  # Use this codex binary as given
 ```
 
 ## How It Works
