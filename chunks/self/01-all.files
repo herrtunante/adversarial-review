@@ -1,0 +1,17 @@
+# adversarial-review reviewing itself: every script, the shared libraries, the prompt templates (prompt and parser are one contract) and the project notes
+adversarial_review.sh
+aggregate_review.sh
+lib/circuit_breaker.sh
+lib/date_utils.sh
+lib/response_analyzer.sh
+lib/transient.sh
+prompts/cross_review.md
+prompts/initial_review.md
+prompts/meta_review.md
+prompts/synthesis.md
+run_chunked_review.sh
+run_filelist_review.sh
+scheduled_restart.sh
+supervise_review.sh
+CLAUDE.md
+README.md

@@ -31,6 +31,7 @@ TIMEOUT_MIN=15
 # Passed straight through to the driver. A chunk whose files are longer than the default line cap needs this, or
 # the agents review a truncated file and never know it.
 EXTRA_ARGS=()
+ONLY_GLOB=""           # the driver's --only, also needed here to count what is left
 RETRY_WAIT=1800        # after a driver gives up on a dead CLI
 CRASH_WAIT=300         # after any other unexpected exit
 MAX_RESTARTS=48        # 24h of 30-minute retries, then stop
@@ -43,7 +44,7 @@ while [[ $# -gt 0 ]]; do
         -t|--timeout) TIMEOUT_MIN="$2"; shift 2 ;;
         --max-lines|--max-files)
                       EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-        --only)       EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --only)       ONLY_GLOB="$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         *)            MANIFEST="$1"; shift ;;
     esac
 done
@@ -53,13 +54,24 @@ done
     exit 1
 }
 
+# Make the three paths absolute while the caller's directory is still current:
+# the cd below would otherwise reinterpret a relative --target, -o or manifest
+# against this script's directory. OUT_ARG keeps the caller's spelling, because
+# a driver started by hand may carry it on its command line (see driver_running).
+[[ -d "$TARGET" ]]   || { echo "[supervise] target not found: $TARGET" >&2; exit 1; }
+[[ -f "$MANIFEST" ]] || { echo "[supervise] manifest not found: $MANIFEST" >&2; exit 1; }
+OUT_ARG="$OUT"
+TARGET="$(cd "$TARGET" && pwd)" || exit 1
+mkdir -p "$OUT" || exit 1
+OUT="$(cd "$OUT" && pwd)" || exit 1
+MANIFEST="$(cd "$(dirname "$MANIFEST")" && pwd)/$(basename "$MANIFEST")" || exit 1
+
 # chunk_is_reviewed and the rules behind it, shared with the driver so the two agree on what "done" means.
 # Without this the function is simply undefined here, every call exits 127, and incomplete_chunks counts every
 # chunk in the manifest as unfinished - which is what made this restart a twenty-chunk run that needed seven.
 . "$SCRIPT_DIR/lib/transient.sh"
 
 cd "$SCRIPT_DIR" || exit 1
-mkdir -p "$OUT"
 LOG="$OUT/driver.log"
 SUPLOG="$OUT/supervise.log"
 
@@ -77,20 +89,34 @@ driver_running() {
         c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
         case "$c" in
             *shell-snapshots*) continue ;;
-            bash\ *run_chunked_review.sh*"$OUT"*) return 0 ;;
+            # Either spelling of the output directory: this script hands the driver the absolute one, a driver
+            # started by hand may have been given the relative one.
+            bash\ *run_chunked_review.sh*"$OUT"*|bash\ *run_chunked_review.sh*"$OUT_ARG"*) return 0 ;;
         esac
     done
     return 1
 }
 
+# Did the driver record this chunk as empty (no source file left after exclusion)? index.tsv is append-only, so
+# the chunk's last row is the one that counts. Such a chunk never gets a directory or a report, and counting it
+# as unfinished would keep the supervisor restarting a driver that has nothing to do.
+chunk_is_empty() {
+    [[ -f "$OUT/index.tsv" ]] || return 1
+    awk -F'\t' -v id="$1" '$1 == id { s = $4 } END { exit (s == "empty") ? 0 : 1 }' "$OUT/index.tsv"
+}
+
 # Chunks in the manifest the driver would still run. chunk_is_reviewed is the driver's own test, from
 # lib/transient.sh: this used to ask only whether a status block existed, which answered "all chunks complete" for
 # chunks whose debate had an agent missing, so the supervisor never started the driver that would have redone them.
+# Chunks outside --only are not counted (the driver never runs them), nor are chunks it recorded as empty.
 incomplete_chunks() {
     local id n=0
     while IFS='|' read -r id _; do
         id="$(echo "$id" | xargs)"
         [[ -z "$id" || "$id" == \#* ]] && continue
+        # shellcheck disable=SC2053
+        [[ -n "$ONLY_GLOB" && "$id" != $ONLY_GLOB ]] && continue
+        chunk_is_empty "$id" && continue
         chunk_is_reviewed "$OUT/$id" || n=$((n + 1))
     done < <(sed 's/\r$//; s/#.*//' "$MANIFEST")
     echo "$n"
@@ -164,6 +190,8 @@ while :; do
     fi
 
     say "starting driver ($left chunk(s) left)"
-    "$DRIVER" --target "$TARGET" -t "$TIMEOUT_MIN" "${EXTRA_ARGS[@]}" --resume -o "$OUT" "$MANIFEST" >> "$LOG" 2>&1
+    # ${a[@]+"${a[@]}"}: under set -u, bash before 4.4 (Git Bash ships 4.3) treats an empty array as unset and
+    # aborts the script here when none of the pass-through options was given.
+    "$DRIVER" --target "$TARGET" -t "$TIMEOUT_MIN" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} --resume -o "$OUT" "$MANIFEST" >> "$LOG" 2>&1
     say "driver exited with code $?"
 done

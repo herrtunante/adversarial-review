@@ -120,37 +120,44 @@ record_iteration_result() {
     local new_state="$current_state"
     local reason=""
 
-    case $current_state in
-        "$CB_STATE_CLOSED")
-            if [[ $no_progress -ge $CB_NO_PROGRESS_THRESHOLD ]]; then
-                new_state="$CB_STATE_OPEN"
-                reason="No progress in $no_progress iterations - agents may be stuck"
-            elif [[ $disagreement -ge $CB_DISAGREEMENT_THRESHOLD ]]; then
-                new_state="$CB_STATE_OPEN"
-                reason="Persistent disagreement for $disagreement iterations"
-            elif [[ $same_issues -ge $CB_SAME_ISSUES_THRESHOLD ]]; then
-                new_state="$CB_STATE_OPEN"
-                reason="Same issues found $same_issues times - unfixable or false positives"
-            elif [[ $no_progress -ge 2 || $disagreement -ge 2 ]]; then
-                new_state="$CB_STATE_HALF_OPEN"
-                reason="Monitoring: possible stagnation"
-            fi
-            ;;
+    # The three opening conditions apply to both active states. They used to be tested only from CLOSED, which
+    # moves to HALF_OPEN at 2 disagreements - and HALF_OPEN looked at no-progress alone, so with the default
+    # threshold of 5 "persistent disagreement" could never open the breaker, and "same issues" was ignored once
+    # half-open.
+    if [[ "$current_state" != "$CB_STATE_OPEN" ]]; then
+        if [[ $no_progress -ge $CB_NO_PROGRESS_THRESHOLD ]]; then
+            new_state="$CB_STATE_OPEN"
+            reason="No progress in $no_progress iterations - agents may be stuck"
+        elif [[ $disagreement -ge $CB_DISAGREEMENT_THRESHOLD ]]; then
+            new_state="$CB_STATE_OPEN"
+            reason="Persistent disagreement for $disagreement iterations"
+        elif [[ $same_issues -ge $CB_SAME_ISSUES_THRESHOLD ]]; then
+            new_state="$CB_STATE_OPEN"
+            reason="Same issues found $same_issues times - unfixable or false positives"
+        fi
+    fi
 
-        "$CB_STATE_HALF_OPEN")
-            if [[ $fixes_made -gt 0 ]] && [[ $agents_agree -eq 1 ]]; then
-                new_state="$CB_STATE_CLOSED"
-                reason="Progress detected, recovered"
-            elif [[ $no_progress -ge $CB_NO_PROGRESS_THRESHOLD ]]; then
-                new_state="$CB_STATE_OPEN"
-                reason="No recovery after monitoring"
-            fi
-            ;;
+    if [[ "$new_state" != "$CB_STATE_OPEN" ]]; then
+        case $current_state in
+            "$CB_STATE_CLOSED")
+                if [[ $no_progress -ge 2 || $disagreement -ge 2 ]]; then
+                    new_state="$CB_STATE_HALF_OPEN"
+                    reason="Monitoring: possible stagnation"
+                fi
+                ;;
 
-        "$CB_STATE_OPEN")
-            reason="Circuit open - manual reset required"
-            ;;
-    esac
+            "$CB_STATE_HALF_OPEN")
+                if [[ $fixes_made -gt 0 ]] && [[ $agents_agree -eq 1 ]]; then
+                    new_state="$CB_STATE_CLOSED"
+                    reason="Progress detected, recovered"
+                else
+                    reason="Monitoring: possible stagnation"
+                fi
+                ;;
+        esac
+    elif [[ "$current_state" == "$CB_STATE_OPEN" ]]; then
+        reason="Circuit open - manual reset required"
+    fi
 
     # Update total opens
     local total_opens=$(echo "$state_data" | jq -r '.total_opens' | tr -d '[:space:]')

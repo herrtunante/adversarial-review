@@ -83,8 +83,8 @@ been rewritten. Three constraints, all load-bearing:
    ~32KB Windows `CreateProcess` command-line limit.
 3. **`-o/--output-last-message` is mandatory, not a nicety.** `codex exec` echoes the entire prompt
    plus a banner to stdout, and the prompt templates contain *example* status blocks. Capturing
-   stdout would feed those examples to `parse_status_block`'s `sed` range match and corrupt the
-   parse. `-o` writes only the final agent message; the full transcript goes to
+   stdout would hand those examples to `parse_status_block`, which would take one as the agent's
+   status whenever the real block is missing. `-o` writes only the final agent message; the full transcript goes to
    `logs/<artifact>.codex.log`.
 
 ## Architecture
@@ -119,8 +119,10 @@ running this against a dirty working tree as destructive — the target should b
 
 Every prompt template ends with a mandated fenced block (`---REVIEW_STATUS---`,
 `---CROSS_REVIEW_STATUS---`, `---META_REVIEW_STATUS---`, `---SYNTHESIS_STATUS---`). The script's
-`parse_status_block()` `sed`-extracts it, strips `---` lines, and hand-rolls `KEY: value` pairs
-into JSON that drives every control decision (loop exit, circuit-breaker input, tracking history).
+`parse_status_block()` takes the last complete block in the file (an earlier one can be an example
+quoted in prose) and builds JSON from its `KEY: value` pairs with `jq`, so any summary text gives
+valid JSON. That JSON drives every control decision (loop exit, circuit-breaker input, tracking
+history). An unterminated block counts as no block.
 
 Consequences worth knowing before editing prompts or the parser:
 
@@ -129,14 +131,16 @@ Consequences worth knowing before editing prompts or the parser:
   `// false` jq defaults kick in, and the run continues as if nothing was found.
 - The parser coerces `YES`/`FULL` → `true` and `NO`/`LOW` → `false`, so `CONFIDENCE: LOW` lands in
   the JSON as a boolean, not a string.
-- `IFS=:` splits on the first colon only, so a `SUMMARY:` containing a colon is truncated.
 - A bare `NO_ISSUES` line is a recognized fallback when no block is present.
 
 ### Exit conditions
 
 The loop ends when both phase-1 agents report `exit_signal: true`; when phase-4 synthesis reports
 `EXIT_SIGNAL: true`; on `MAX_ITERATIONS`; or when the circuit breaker is `OPEN`. Final state lands
-in `tracking.json` as `clean` / `circuit_open` / `max_iterations`.
+in `tracking.json` as `clean` / `circuit_open` / `max_iterations`, or `report_only` for a `--no-fix`
+run. Two more statuses mean the run did not do its job, and both exit non-zero: `agent_failure` (see
+below) and `empty_scope` (the source dump was empty, so no agent was called; a review of nothing
+used to be recorded as `clean`).
 
 ### Circuit breaker (`lib/circuit_breaker.sh`)
 
@@ -158,6 +162,9 @@ unfalsifiable or dead:
   (the previous approach) never matched across iterations because LLM wording varies, so this
   trigger could not fire at all. Stripping line numbers matters because they shift as fixes land.
 
+Any of the three can open the breaker, from CLOSED or from HALF_OPEN. Before, HALF_OPEN only
+tested progress, so persistent disagreement could never open it with the default thresholds.
+
 OPEN is terminal and requires `--reset-circuit`; `can_execute` is checked at the top of each
 iteration. Note that a `--dry-run` drives the breaker to OPEN, so reset before a real run.
 
@@ -165,16 +172,24 @@ iteration. Note that a `--dry-run` drives the breaker to OPEN, so reset before a
 
 `wait_for_agents` replaces the old `wait $pid || true`. Exit codes are no longer discarded: a
 single agent failure logs and degrades, both failing returns `2`, which each phase propagates so
-`run_review_loop` halts with `status: agent_failure`. Without this, a crashed or timed-out agent
+`run_review_loop` halts with `status: agent_failure`. A synthesis that fails, or writes no complete
+status block, ends the same way in report-only mode instead of as `report_only`. Without this, a crashed or timed-out agent
 produced an artifact with no status block, which parses to zero issues and is indistinguishable
 from a clean review — the loop would burn every remaining iteration on empty input.
+
+On INT or TERM the script kills its agents, releases the lock and exits 130 or 143. Only the
+process that took the lock removes it. The trap used to delete the lock and let the loop carry on
+unlocked. Started with `nohup ... &` from a non-interactive shell, INT is inherited as ignored, so
+stop such a run with TERM. Native children that Git Bash cannot see (node under `codex.cmd`) may
+outlive the stop.
 
 ### Source collection is the main scope limit
 
 `collect_source_code()` builds one flat text dump and is the only thing the agents see in phase 1
 — they do get the target as cwd, but the prompt itself is this dump. It walks **Java, Python and
 TS/JS at `MAX_SOURCE_FILES` each (default 30) and shell at `MAX_SOURCE_SHELL_FILES` (default 10)**,
-truncating to `MAX_SOURCE_LINES` / `MAX_SOURCE_SHELL_LINES` (500 / 300). Any other language (Go,
+truncating to `MAX_SOURCE_LINES` / `MAX_SOURCE_SHELL_LINES` (500 / 300). A file cut at the cap carries a
+`FILE TRUNCATED BY THE REVIEW TOOL` line in the dump, so agents know they saw only part of it. Any other language (Go,
 Rust, C…) is still invisible. Widening coverage or the caps happens here and directly drives prompt
 size and cost.
 
@@ -188,7 +203,8 @@ path per line (relative to the target; blank lines and `#` comments ignored), an
 exactly those files, in that order. The directory walk, the per-language caps and
 `MAX_SOURCE_EXCLUDE` are all skipped; only `MAX_SOURCE_LINES` still applies, so raise it if any
 listed file is longer than 500 lines. Any file type is accepted, which also makes it the way to
-review a language the walk ignores. A listed path that does not exist is warned about and skipped.
+review a language the walk ignores. A listed path that does not exist is warned about and skipped;
+if every path is missing the run stops with `empty_scope`.
 
 Two caps-related gotchas:
 
@@ -213,7 +229,17 @@ a time, and `aggregate_review.sh` merges the per-chunk synthesis reports into on
 
 A manifest line is `chunk_id | module_root | include_path[,include_path...]`. The module root
 becomes the agents' cwd, so they keep that module's build file in view; the include paths are
-everything the dump is allowed to contain.
+everything the dump is allowed to contain. An empty include, or `.`, means the whole module, and a
+trailing slash makes no difference. An include that is not an existing directory fails its chunk;
+it used to shrink the chunk silently, so run `--list` after editing a manifest.
+
+The manifest is validated before anything is created or deleted. A chunk id must be a plain name
+(letters, digits, `.`, `_`, `-`, no `..`, not starting with `.` or `-`) because it names a directory
+the driver removes and rewrites, and ids must be unique. `run_filelist_review.sh` applies the same
+rule to the list file names it takes its ids from.
+
+The driver exits 0 only when every selected chunk is reviewed or was recorded as empty, 1 for bad
+arguments or a bad manifest, and 2 when one or more chunks failed. It used to exit 0 regardless.
 
 Things the driver has to do because state in this repo is global, not per-run:
 
@@ -230,16 +256,24 @@ Things the driver has to do because state in this repo is global, not per-run:
 - Chunks default to `--no-fix`. Twenty unattended synthesis passes writing into a shared target is
   not something to start by accident; `--fix` opts in.
 
-A chunk is only archived as done if it survives three checks, and `--resume` redoes any chunk
-whose phase-4 report lacks a real `SYNTHESIS_STATUS` block (a `tracking.json` alone proves
-nothing):
+`chunk_is_reviewed` in `lib/transient.sh` is the one answer to "is this chunk reviewed?", shared by
+the driver, the supervisor, the file-list wrapper and the aggregator. The newest synthesis report
+(by iteration number) must hold a complete `SYNTHESIS_STATUS` block, and no artifact may be a failed
+agent call: a quota or connection error, an empty file, or the `CODEX PRODUCED NO FINAL MESSAGE`
+note `run_codex` writes when Codex gives no answer, whatever the cause. A chunk both agents found
+clean in phase 1 has no synthesis; it counts through `status: clean` in its `tracking.json`.
+`--resume` redoes any chunk the function rejects.
+
+A chunk is only archived as done if it also survives three checks:
 
 - **Transient failure.** A quota refusal or a dropped network does not stop a phase. The agent
   writes a one-line error in place of the review, which parses to zero issues and looks exactly
   like clean code. `artifact_is_transient_failure` recognises two shapes: a short file (under 2 KB)
-  holding a quota or connection error, or a Codex transcript (copied in by `run_codex`'s fallback)
-  with timestamped transport `ERROR` lines. The broad phrases are only trusted in short files; in
-  a full review they match findings about rate limiting. On a hit the driver waits for
+  holding a quota or connection error, or Codex's timestamped transport `ERROR` lines. The broad
+  phrases are only trusted in short files; in a full review they match findings about rate
+  limiting. A short file with a complete status block or a bare `NO_ISSUES` is a real answer and is
+  never treated as a refusal. A Codex timeout is a failed call but not a transient one: the chunk
+  is rejected by `chunk_is_reviewed` and redone on the next `--resume`, without the quota wait. On a hit the driver waits for
   `claude --print` to answer a probe (every 5 minutes, up to 2 hours) and redoes the chunk.
 - **Scope contamination.** The Codex transcript echoes the prompt, so its `=== FILE:` markers are a
   record of what the agent was really shown. Any path the chunk's exclude regex would have dropped
@@ -257,8 +291,12 @@ two chunks while the driver is still alive.
 
 For an unattended run, start `supervise_review.sh` instead of the driver. The driver gives up after
 two hours without a working agent CLI, which an overnight quota reset or a sleeping laptop easily
-exceeds. The supervisor restarts it with `--resume` until every chunk has a real synthesis report,
-and waits for any driver already running rather than starting a second. A saved debate sits beside
+exceeds. The supervisor restarts it with `--resume` until `chunk_is_reviewed` accepts every chunk the
+driver would run, and waits for any driver already running rather than starting a second. It
+respects `--only`, does not count chunks the driver recorded as empty, and gives up on chunks that
+still fail after two extra passes. `--target`, `-o` and the manifest are resolved from the
+directory it was started in. A manifest the driver rejects (exit 1) is not told apart from a crash,
+so the supervisor retries it every five minutes; check the manifest with `--list` first. A saved debate sits beside
 the chunk directory as `<out>/.salvage-<chunk>/`, so it survives those restarts. To change the
 driver while a run is live, stage the new version as `run_chunked_review.next.sh`; the supervisor
 installs it only in the gap between driver runs, because bash reads a script as it executes and an
@@ -292,8 +330,9 @@ halves rather than dividing it.
 
 ## Known Traps
 
-- **`-p/--prompt` is destructive**: it `cp`s your file *over* `prompts/initial_review.md`,
-  permanently replacing the repo's template. Check `git status` after using it.
+- **`-p/--prompt FILE` applies to that run only.** It used to copy the file over
+  `prompts/initial_review.md`, permanently replacing the repo's template; it now reads the file as
+  the phase-1 template and touches nothing. A missing file stops the run.
 - **Every phase must pass `target_dir` to `run_claude`/`run_codex`.** The third argument defaults
   to `${3:-$PWD}`, which is the *invocation* directory, not the target. Phases 2 and 3 used to omit
   it, so cross-review and meta-review ran against this repo instead of the code under review.

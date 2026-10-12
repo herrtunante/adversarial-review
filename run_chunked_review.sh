@@ -109,27 +109,100 @@ re_escape() {
     printf '%s' "$1" | sed -e 's/[][\\.*^$(){}?+|]/\\&/g'
 }
 
+# Strip leading and trailing blanks.
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# One include path in canonical form: surrounding blanks trimmed, empty and "."
+# segments dropped, so no leading "./", no doubled or trailing slash. The result
+# is empty when the path names the module root itself.
+normalise_include() {
+    local raw="$1" seg out="" segs=()
+    raw="$(trim "$raw")"
+    IFS='/' read -ra segs <<< "$raw" || true
+    for seg in ${segs[@]+"${segs[@]}"}; do
+        [[ -z "$seg" || "$seg" == "." ]] && continue
+        out="${out:+$out/}$seg"
+    done
+    printf '%s' "$out"
+}
+
+# Turn a manifest include field into the global array `incs`, normalised and
+# checked. An empty field or a "." entry gives the single entry "" (the whole
+# module). Returns 1, with a message, for an include that leaves the module or
+# is not a directory: build_exclude would silently reduce such a chunk to the
+# loose files of whatever ancestor directories do exist.
+resolve_includes() {
+    local module_abs="$1" raw="$2" inc raw_incs=()
+    incs=()
+    IFS=',' read -ra raw_incs <<< "$raw" || true
+    for inc in ${raw_incs[@]+"${raw_incs[@]}"}; do
+        # A stray comma ("a,,b" or "a,") is not a request for the whole module.
+        [[ -z "${inc//[[:space:]]/}" ]] && continue
+        inc="$(normalise_include "$inc")"
+        if [[ -z "$inc" ]]; then
+            incs=("")
+            return 0
+        fi
+        case "/$inc/" in
+            */../*) err "include path must stay inside the module: $inc"; return 1 ;;
+        esac
+        if [[ ! -d "$module_abs/$inc" ]]; then
+            err "include path is not a directory: $module_abs/$inc"
+            return 1
+        fi
+        incs+=("$inc")
+    done
+    if [[ ${#incs[@]} -eq 0 ]]; then
+        incs=("")
+    fi
+    return 0
+}
+
 # Build the exclusion regex that leaves only $includes visible under $module.
 #
 # filter_excluded uses `grep -Ev`, i.e. it can only subtract. To express "keep
 # only these subtrees" we enumerate the complement: walk from the module root
 # down each include path and, at every level, exclude the sibling directories
 # that are not themselves on an include path.
+#
+# An include that is empty (or ".") means the whole module, so nothing is
+# excluded beyond BASE_EXCLUDE. Includes are normalised first, so "src/main/",
+# "./src/main" and "src//main" all mean "src/main". The module root is
+# canonicalised with `cd && pwd`, exactly as adversarial_review.sh canonicalises
+# its target: the regex is matched against the paths the collector's find
+# prints, and a module of "." would otherwise never match any of them.
 build_exclude() {
     local module_abs="$1"
     shift
-    local includes=("$@")
-    local keep=() parts=()
+    local includes=() keep=() parts=() segs=()
     local inc cur seg sub d is_kept parent
+
+    module_abs="$(cd "$module_abs" 2>/dev/null && pwd)" || return 1
+
+    for inc in "$@"; do
+        inc="$(normalise_include "$inc")"
+        if [[ -z "$inc" ]]; then
+            printf '%s' "$BASE_EXCLUDE"
+            return 0
+        fi
+        includes+=("$inc")
+    done
+    if [[ ${#includes[@]} -eq 0 ]]; then
+        printf '%s' "$BASE_EXCLUDE"
+        return 0
+    fi
 
     for inc in "${includes[@]}"; do
         cur="$module_abs"
         keep+=("$cur")
-        [[ -z "$inc" ]] && continue
-        local oldifs="$IFS"
-        IFS='/'
-        local segs=($inc)
-        IFS="$oldifs"
+        # read -a, not an unquoted expansion: a segment holding * or ? must not
+        # be expanded against the current directory.
+        IFS='/' read -ra segs <<< "$inc" || true
         for seg in "${segs[@]}"; do
             [[ -z "$seg" ]] && continue
             cur="$cur/$seg"
@@ -233,12 +306,16 @@ chunk_scope_is_intact() {
     [[ -n "$log" && -f "$log" ]] || return 0   # nothing to check against
 
     local n_total n_foreign
-    n_total=$(grep -cE '^=== FILE: ' "$log" 2>/dev/null || echo 0)
-    [[ "$n_total" -gt 0 ]] || return 0
+    # grep -c prints its own 0 and exits 1 when nothing matches, so `|| echo 0`
+    # would yield two lines ("0\n0") and break the numeric test below.
+    n_total=$(grep -cE '^=== FILE: ' "$log" 2>/dev/null || true)
+    [[ "${n_total:-0}" -gt 0 ]] || return 0
 
+    # The prefix goes in through the environment: as a sed replacement it broke
+    # on a module path holding '#' or '&', and awk -v would unescape backslashes.
     n_foreign=$(grep -oE '^=== FILE: .* ===' "$log" 2>/dev/null \
                 | sed -E 's/^=== FILE: (.*) ===$/\1/' \
-                | sed "s#^#$module_abs/#" \
+                | PREFIX="$module_abs/" awk '{ print ENVIRON["PREFIX"] $0 }' \
                 | grep -Ec "$exclude" || true)
 
     if [[ "${n_foreign:-0}" -gt 0 ]]; then
@@ -285,18 +362,43 @@ wait_for_claude() {
 }
 
 # --- parse manifest ----------------------------------------------------------
-declare -a IDS MODULES INCLUDES
+#
+# A chunk id becomes a directory name under the output root, and that directory
+# (and .salvage-<id> beside it) is removed with rm -rf on a retry. So every id is
+# checked here, before anything is created or deleted: an id of "../x" would
+# otherwise delete outside the output directory, and two chunks sharing an id
+# would overwrite or skip each other.
+declare -a IDS=() MODULES=() INCLUDES=()
+lineno=0
 while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
     line="${line%$'\r'}"
     line="${line%%#*}"
-    [[ -z "${line// /}" ]] && continue
+    [[ -z "${line//[[:space:]]/}" ]] && continue
     IFS='|' read -r cid mod inc <<< "$line"
-    cid="$(echo "$cid" | xargs || true)"
-    mod="$(echo "$mod" | xargs || true)"
-    inc="$(echo "${inc:-}" | xargs || true)"
-    if [[ -z "$cid" || -z "$mod" ]]; then
-        warn "skipping malformed line: $line"
-        continue
+    # Trimmed in the shell, not through xargs: xargs also strips quotes and
+    # backslashes, so an id of 'a' reached the check below as a harmless 'ab'.
+    cid="$(trim "$cid")"
+    mod="$(trim "$mod")"
+    inc="$(trim "${inc:-}")"
+    if [[ -z "$cid" ]]; then
+        err "$MANIFEST line $lineno: chunk id is empty: $line"
+        exit 1
+    fi
+    if [[ ! "$cid" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ || "$cid" == *..* ]]; then
+        err "$MANIFEST line $lineno: invalid chunk id '$cid'"
+        err "an id may hold letters, digits, '.', '_' and '-' only, must not start with '.' or '-', and must not contain '..'"
+        exit 1
+    fi
+    for seen in ${IDS[@]+"${IDS[@]}"}; do
+        if [[ "$seen" == "$cid" ]]; then
+            err "$MANIFEST line $lineno: duplicate chunk id '$cid'"
+            exit 1
+        fi
+    done
+    if [[ -z "$mod" ]]; then
+        err "$MANIFEST line $lineno: chunk '$cid' has no module root (use '.' for the target itself)"
+        exit 1
     fi
     IDS+=("$cid"); MODULES+=("$mod"); INCLUDES+=("$inc")
 done < "$MANIFEST"
@@ -313,8 +415,11 @@ if [[ "$LIST_ONLY" == "1" ]]; then
             warn "${IDS[$i]}: module root missing: ${MODULES[$i]}"
             continue
         fi
-        IFS=',' read -ra incs <<< "${INCLUDES[$i]}"
-        [[ ${#incs[@]} -eq 0 ]] && incs=("")
+        module_abs="$(cd "$module_abs" && pwd)"
+        if ! resolve_includes "$module_abs" "${INCLUDES[$i]}"; then
+            warn "${IDS[$i]}: not listed - fix its include path"
+            continue
+        fi
         exclude="$(build_exclude "$module_abs" "${incs[@]}")"
         read -r nf kb < <(chunk_stats "$module_abs" "$exclude")
         total_f=$((total_f + nf)); total_kb=$((total_kb + kb))
@@ -342,12 +447,14 @@ INDEX="$OUT_DIR/index.tsv"
 [[ -f "$INDEX" ]] || printf "chunk_id\tfiles\tsize_kb\tstatus\titerations\tduration_s\n" > "$INDEX"
 
 failed=0
+selected=0
 for i in "${!IDS[@]}"; do
     cid="${IDS[$i]}"
     if [[ -n "$ONLY_GLOB" ]]; then
         # shellcheck disable=SC2053
         [[ "$cid" == $ONLY_GLOB ]] || continue
     fi
+    selected=$((selected + 1))
 
     chunk_out="$OUT_DIR/$cid"
     if [[ "$RESUME" == "1" ]] && chunk_is_complete "$chunk_out"; then
@@ -365,8 +472,14 @@ for i in "${!IDS[@]}"; do
         failed=$((failed + 1))
         continue
     fi
-    IFS=',' read -ra incs <<< "${INCLUDES[$i]}"
-    [[ ${#incs[@]} -eq 0 ]] && incs=("")
+    # Same canonical form the collector gives its target, so the exclude regex,
+    # the size estimate and the scope check all see the paths find will print.
+    module_abs="$(cd "$module_abs" && pwd)"
+    if ! resolve_includes "$module_abs" "${INCLUDES[$i]}"; then
+        err "$cid: bad include path, chunk not run"
+        failed=$((failed + 1))
+        continue
+    fi
     exclude="$(build_exclude "$module_abs" "${incs[@]}")"
     read -r nf kb < <(chunk_stats "$module_abs" "$exclude")
 
@@ -489,6 +602,12 @@ for i in "${!IDS[@]}"; do
     if [[ $rc -ne 0 ]]; then
         status="${status}(rc=$rc)"
         failed=$((failed + 1))
+    elif [[ "$DRY_RUN" != "1" ]] && ! chunk_is_complete "$chunk_out"; then
+        # The review exited 0 but left nothing --resume would accept (an agent
+        # that produced no final message, say). That is a failed chunk, and the
+        # exit code has to say so. A dry run only writes stubs, so it is exempt.
+        warn "$cid: review exited 0 but the chunk does not count as reviewed"
+        failed=$((failed + 1))
     fi
 
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$cid" "$nf" "$kb" "$status" "$iters" "$dur" >> "$INDEX"
@@ -505,7 +624,15 @@ done
 echo ""
 ok "run complete: $OUT_DIR"
 column -t -s "$(printf '\t')" "$INDEX" 2>/dev/null || cat "$INDEX"
+if [[ -n "$ONLY_GLOB" && $selected -eq 0 ]]; then
+    warn "no chunk id matches --only '$ONLY_GLOB' - nothing was run"
+fi
+# Exit codes: 0 every selected chunk is reviewed (or was recorded as empty),
+# 1 bad arguments or manifest, 2 one or more chunks failed, 3 the agent CLI did
+# not recover, 4 another review holds the lock. supervise_review.sh still reads
+# the "run complete" line above, so that line is printed in both cases.
 if [[ $failed -gt 0 ]]; then
-    warn "$failed chunk(s) reported a failure"
+    warn "$failed chunk(s) failed - rerun with --resume to redo them"
+    exit 2
 fi
 exit 0

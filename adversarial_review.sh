@@ -14,7 +14,7 @@
 # Options:
 #   -h, --help              Show help message
 #   -m, --max-iters N       Maximum iterations (default: 3)
-#   -p, --prompt FILE       Custom review prompt file
+#   -p, --prompt FILE       Custom phase-1 review prompt, for this run only
 #   -v, --verbose           Verbose output
 #   -t, --timeout MIN       Timeout per agent call in minutes (default: 10)
 #   --status                Show current status
@@ -66,6 +66,9 @@ MAX_SOURCE_EXCLUDE="${MAX_SOURCE_EXCLUDE:-}"
 # A file naming exactly the files to review, one path per line relative to the
 # target. When set it replaces the directory walk and the per-language caps.
 SOURCE_FILE_LIST="${SOURCE_FILE_LIST:-}"
+# Phase-1 prompt template. -p/--prompt points this at another file for one run;
+# the repo's own template is never overwritten.
+INITIAL_PROMPT_FILE="$PROMPTS_DIR/initial_review.md"
 
 # Colors
 RED='\033[0;31m'
@@ -215,8 +218,30 @@ add_to_history() {
     ' "$TRACKING_FILE" > "$tmp" && mv "$tmp" "$TRACKING_FILE"
 }
 
+# Print the body of the LAST complete ---NAME--- ... ---END_NAME--- block in a
+# file, without the delimiter lines. Returns 1 when the file has no complete
+# block. The last one is the agent's real status: earlier ones can be examples
+# quoted in the prose, and merging them (the old sed range did) let an example
+# override the answer. A block that is opened and never closed does not count.
+extract_status_block() {
+    local file="$1"
+    local block_name="$2"
+
+    [[ -f "$file" ]] || return 1
+    tr -d '\r' < "$file" | awk -v s="---${block_name}---" -v e="---END_${block_name}---" '
+        index($0, e)        { if (inb) { last = buf; found = 1 }; inb = 0; next }
+        index($0, s)        { buf = ""; inb = 1; next }
+        inb                 { buf = buf $0 "\n" }
+        END                 { if (!found) exit 1; printf "%s", last }'
+}
+
 # Parse status block from agent output
 # Format: ---REVIEW_STATUS--- ... ---END_REVIEW_STATUS---
+#
+# The JSON is built by jq, never by string concatenation: a SUMMARY holding a
+# quote, a backslash or a tab used to produce invalid JSON, after which every
+# `jq -r '.x // default'` on the result printed nothing and the exit signal was
+# lost. Each line is split at its FIRST colon, so a value may contain colons.
 parse_status_block() {
     local file="$1"
     local block_name="${2:-REVIEW_STATUS}"
@@ -226,13 +251,10 @@ parse_status_block() {
         return 1
     fi
 
-    # Extract the status block
-    local content=$(cat "$file")
-    local block=$(echo "$content" | sed -n "/---${block_name}---/,/---END_${block_name}---/p" | grep -v "^---")
-
-    if [[ -z "$block" ]]; then
+    local block
+    if ! block=$(extract_status_block "$file" "$block_name"); then
         # No status block found, try to detect NO_ISSUES
-        if echo "$content" | grep -qE '^\s*NO_ISSUES\s*$'; then
+        if grep -qE '^[[:space:]]*NO_ISSUES[[:space:]]*$' "$file"; then
             echo '{"exit_signal": true, "issues_found": 0}'
             return 0
         fi
@@ -240,32 +262,52 @@ parse_status_block() {
         return 1
     fi
 
-    # Parse key: value pairs into JSON
-    local json="{"
-    local first=true
-    while IFS=: read -r key value; do
-        [[ -z "$key" ]] && continue
-        key=$(echo "$key" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-        value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-        [[ "$first" == "true" ]] && first=false || json+=","
-
-        # Determine type
-        if [[ "$value" =~ ^[0-9]+$ ]]; then
-            json+="\"$key\": $value"
-        elif [[ "$value" == "true" || "$value" == "false" ]]; then
-            json+="\"$key\": $value"
-        elif [[ "$value" == "YES" || "$value" == "FULL" ]]; then
-            json+="\"$key\": true"
-        elif [[ "$value" == "NO" || "$value" == "LOW" ]]; then
-            json+="\"$key\": false"
-        else
-            json+="\"$key\": \"$value\""
-        fi
-    done <<< "$block"
-    json+="}"
+    # KEY: value lines -> one JSON object. Keys are lowercased with whitespace
+    # removed; values are trimmed. Digits become numbers, true/YES/FULL become
+    # true, false/NO/LOW become false, anything else stays a string. Lines
+    # without a colon are ignored.
+    local json
+    if ! json=$(printf '%s\n' "$block" | jq -Rnc '
+        [ inputs
+          | index(":") as $i
+          | select($i != null)
+          | { key:   (.[:$i] | gsub("[[:space:]]"; "") | ascii_downcase),
+              value: (.[$i + 1:] | sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; "")) }
+          | select(.key != "")
+          | .value |= ( if test("^[0-9]+$") then tonumber
+                        elif . == "true" or . == "YES" or . == "FULL" then true
+                        elif . == "false" or . == "NO" or . == "LOW" then false
+                        else . end )
+        ] | from_entries' | tr -d '\r') || [[ -z "$json" ]]; then
+        echo '{"error": "status block not parseable"}'
+        return 1
+    fi
+    if [[ "$json" == "{}" ]]; then
+        # Delimiters with no KEY: value line between them carry no status.
+        echo '{"error": "no status block"}'
+        return 1
+    fi
 
     echo "$json"
+}
+
+# Emit one file of the source dump, and say so when it was cut at the line cap.
+# Without the notice an agent reports the cut as an unclosed block, or approves
+# logic whose second half it never saw. The "=== FILE: " marker format is read
+# by the chunk driver's scope check; do not change it.
+dump_file() {
+    local rel="$1"
+    local path="$2"
+    local max="$3"
+    local total
+
+    printf '\n=== FILE: %s ===\n' "$rel"
+    head -n "$max" "$path" 2>/dev/null || true
+    # grep -c '' also counts a last line that has no trailing newline.
+    total=$(grep -c '' "$path" 2>/dev/null || true)
+    if [[ "${total:-0}" -gt "$max" ]]; then
+        printf '\n[... FILE TRUNCATED BY THE REVIEW TOOL: only the first %s of %s lines are shown above ...]\n' "$max" "$total"
+    fi
 }
 
 # Collect only the files with uncommitted changes (--changed-only).
@@ -284,18 +326,26 @@ collect_changed_files() {
     local abs_target
 
     if ! repo_root=$(git -C "$target_dir" rev-parse --show-toplevel 2>/dev/null); then
-        log_error "--changed-only requires the target to be inside a git repository"
+        # stderr: this function's stdout is the source dump itself.
+        log_error "--changed-only requires the target to be inside a git repository" >&2
         return 1
     fi
 
     abs_target="$(cd "$target_dir" && pwd)"
     log_verbose "Collecting changed files (repo root: $repo_root)"
 
-    local rel path canon
-    while IFS= read -r rel; do
+    # NUL-delimited records, every untracked file listed individually. The plain
+    # format reports a new directory as one "dir/" entry, which is not a file,
+    # so everything inside it was dropped; it also C-quotes unusual names.
+    local entry xy rel path canon
+    while IFS= read -r -d '' entry; do
+        xy="${entry:0:2}"
+        rel="${entry:3}"
+        # A rename or copy is "XY new\0old\0": consume and drop the old path.
+        if [[ "$xy" == *[RC]* ]]; then
+            IFS= read -r -d '' _ || true
+        fi
         [[ -z "$rel" ]] && continue
-        rel="${rel##* -> }"          # renames arrive as "old -> new"
-        rel="${rel#\"}"; rel="${rel%\"}"
         path="$repo_root/$rel"
         [[ -f "$path" ]] || continue
 
@@ -315,14 +365,11 @@ collect_changed_files() {
         esac
 
         log_verbose "Including changed file: $rel"
-        output+="
-=== FILE: $rel ===
-$(head -$max_lines "$path" 2>/dev/null)
-"
-    done < <(git -C "$target_dir" status --porcelain | sed 's/^...//')
+        output+="$(dump_file "$rel" "$path" "$max_lines")"$'\n'
+    done < <(git -C "$target_dir" status --porcelain=v1 -z --untracked-files=all)
 
     if [[ -z "$output" ]]; then
-        log_warning "No changed files found under $target_dir"
+        log_warning "No changed files found under $target_dir" >&2
     fi
 
     echo "$output"
@@ -347,7 +394,7 @@ collect_source_code() {
     local count=0
 
     if [[ "$CHANGED_ONLY" == "1" ]]; then
-        collect_changed_files "$target_dir"
+        collect_changed_files "$target_dir" || return 1
         return 0
     fi
 
@@ -370,10 +417,7 @@ collect_source_code() {
                 log_warning "SOURCE_FILE_LIST: missing $rel" >&2
                 continue
             fi
-            output+="
-=== FILE: $rel ===
-$(head -$max_lines "$target_dir/$rel" 2>/dev/null)
-"
+            output+="$(dump_file "$rel" "$target_dir/$rel" "$max_lines")"$'\n'
         done < "$SOURCE_FILE_LIST"
         echo "$output"
         return 0
@@ -385,48 +429,38 @@ $(head -$max_lines "$target_dir/$rel" 2>/dev/null)
     count=0
     while IFS= read -r file && [[ $count -lt $max_files ]]; do
         [[ -z "$file" ]] && continue
-        local rel="${file#$target_dir/}"
-        output+="
-=== FILE: $rel ===
-$(head -$max_lines "$file" 2>/dev/null)
-"
-        ((count++))
+        # The prefix is quoted so glob characters in the target path are literal,
+        # and the counter avoids ((count++)), which returns 1 from 0 under set -e.
+        local rel="${file#"$target_dir"/}"
+        output+="$(dump_file "$rel" "$file" "$max_lines")"$'\n'
+        count=$((count + 1))
     done < <(find "$target_dir" -name "*.java" -type f ! -path "*/\.*" ! -path "*/target/*" ! -path "*/build/*" 2>/dev/null | filter_excluded | sort)
 
     # Python files
     count=0
     while IFS= read -r file && [[ $count -lt $max_files ]]; do
         [[ -z "$file" ]] && continue
-        local rel="${file#$target_dir/}"
-        output+="
-=== FILE: $rel ===
-$(head -$max_lines "$file" 2>/dev/null)
-"
-        ((count++))
+        local rel="${file#"$target_dir"/}"
+        output+="$(dump_file "$rel" "$file" "$max_lines")"$'\n'
+        count=$((count + 1))
     done < <(find "$target_dir" -name "*.py" -type f ! -path "*/\.*" ! -path "*/__pycache__/*" ! -path "*/venv/*" ! -path "*/.venv/*" 2>/dev/null | filter_excluded | sort)
 
     # TypeScript/JavaScript
     count=0
     while IFS= read -r file && [[ $count -lt $max_files ]]; do
         [[ -z "$file" ]] && continue
-        local rel="${file#$target_dir/}"
-        output+="
-=== FILE: $rel ===
-$(head -$max_lines "$file" 2>/dev/null)
-"
-        ((count++))
+        local rel="${file#"$target_dir"/}"
+        output+="$(dump_file "$rel" "$file" "$max_lines")"$'\n'
+        count=$((count + 1))
     done < <(find "$target_dir" \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -type f ! -path "*/node_modules/*" ! -path "*/\.*" 2>/dev/null | filter_excluded | sort)
 
     # Shell scripts
     count=0
     while IFS= read -r file && [[ $count -lt $MAX_SOURCE_SHELL_FILES ]]; do
         [[ -z "$file" ]] && continue
-        local rel="${file#$target_dir/}"
-        output+="
-=== FILE: $rel ===
-$(head -$MAX_SOURCE_SHELL_LINES "$file" 2>/dev/null)
-"
-        ((count++))
+        local rel="${file#"$target_dir"/}"
+        output+="$(dump_file "$rel" "$file" "$MAX_SOURCE_SHELL_LINES")"$'\n'
+        count=$((count + 1))
     done < <(find "$target_dir" -name "*.sh" -type f ! -path "*/\.*" 2>/dev/null | filter_excluded | sort)
 
     echo "$output"
@@ -484,6 +518,11 @@ run_codex() {
     fi
 
     log_codex "Running..."
+
+    # A file left at this path by an earlier run must not stand in for this
+    # call's answer: the "no final message" test below is `! -s`, which a stale
+    # artifact satisfies, and it would then be parsed as this run's review.
+    rm -f "$output_file"
 
     local timeout_cmd=$(get_timeout_cmd)
     local timeout_secs=$((TIMEOUT_MINUTES * 60))
@@ -596,8 +635,12 @@ wait_for_agents() {
     local claude_rc=0
     local codex_rc=0
 
+    # Tracked so an INT/TERM can stop exactly these jobs (see stop_agents).
+    AGENT_PIDS=("$claude_pid" "$codex_pid")
+
     wait "$claude_pid" || claude_rc=$?
     wait "$codex_pid" || codex_rc=$?
+    AGENT_PIDS=()
 
     [[ $claude_rc -ne 0 ]] && log_error "Claude failed in $phase ($(describe_exit $claude_rc))"
     [[ $codex_rc -ne 0 ]] && log_error "Codex failed in $phase ($(describe_exit $codex_rc))"
@@ -656,8 +699,25 @@ run_phase_1() {
 
     log_info "=== Phase 1: Independent Reviews ==="
 
-    local source_code=$(collect_source_code "$target_dir")
-    local prompt_template=$(cat "$PROMPTS_DIR/initial_review.md")
+    # Declared and assigned separately: `local x=$(...)` returns the status of
+    # `local`, which hid a failed collection. A dump with no file in it is also
+    # refused - two agents answering NO_ISSUES about nothing would otherwise be
+    # recorded as a clean review.
+    local source_code
+    if ! source_code=$(collect_source_code "$target_dir"); then
+        log_error "Source collection failed - nothing was sent to the agents"
+        return 3
+    fi
+    if [[ "$source_code" != *"=== FILE: "* ]]; then
+        log_error "No source files in scope under $target_dir - nothing to review"
+        return 3
+    fi
+
+    local prompt_template
+    if ! prompt_template=$(cat "$INITIAL_PROMPT_FILE"); then
+        log_error "Cannot read the phase-1 prompt: $INITIAL_PROMPT_FILE"
+        return 3
+    fi
 
     local full_prompt="$prompt_template
 
@@ -723,7 +783,15 @@ run_phase_2() {
     # The source must be in context here. cross_review.md asks the agent to verify
     # findings rather than accept them, and to add issues the other agent missed -
     # neither is possible from the other agent's prose alone.
-    local source_code=$(collect_source_code "$target_dir")
+    local source_code
+    if ! source_code=$(collect_source_code "$target_dir"); then
+        log_error "Source collection failed - nothing was sent to the agents"
+        return 3
+    fi
+    if [[ "$source_code" != *"=== FILE: "* ]]; then
+        log_error "No source files in scope under $target_dir - nothing to review"
+        return 3
+    fi
 
     # Claude reviews Codex
     local claude_prompt="$cross_prompt
@@ -928,8 +996,15 @@ Working directory: $target_dir
     local allow_writes="true"
     [[ "$NO_FIX" == "1" ]] && allow_writes="false"
 
+    # Run as a background job and wait on it, like phases 1-3. Bash defers a
+    # trap until a foreground command returns, so with a foreground call an
+    # INT/TERM would only be acted on after the synthesis had finished.
     local synth_rc=0
-    run_claude "$context" "$output_file" "$target_dir" "$allow_writes" || synth_rc=$?
+    run_claude "$context" "$output_file" "$target_dir" "$allow_writes" &
+    local synth_pid=$!
+    AGENT_PIDS=("$synth_pid")
+    wait "$synth_pid" || synth_rc=$?
+    AGENT_PIDS=()
     if [[ $synth_rc -ne 0 ]]; then
         log_error "Synthesis agent failed ($(describe_exit $synth_rc)) - no fixes applied this iteration"
     fi
@@ -967,6 +1042,20 @@ Working directory: $target_dir
             log_error "Report-only mode but the target changed - inspect 'git status' in the target"
         else
             log_success "Report-only: target untouched"
+        fi
+        # The report is this mode's whole product. A synthesis that timed out,
+        # was refused, or stopped before its status block is not a report, and
+        # must not end the run as "Report complete". A dry run is exempt: its
+        # stub artifact has no status block by design.
+        if [[ "$DRY_RUN" != "1" ]]; then
+            if [[ $synth_rc -ne 0 ]]; then
+                log_error "Synthesis produced no usable report: $output_file"
+                return 2
+            fi
+            if ! extract_status_block "$output_file" "SYNTHESIS_STATUS" > /dev/null; then
+                log_error "Synthesis report has no complete SYNTHESIS_STATUS block - not a usable report: $output_file"
+                return 2
+            fi
         fi
         log_success "Report written to $output_file"
         return 0
@@ -1017,6 +1106,90 @@ Working directory: $target_dir
 # so a `local` would be out of scope and `set -u` would abort the trap with
 # "lock_file: unbound variable", leaving the lock behind.
 LOCK_FILE="$AR_DIR/.review.lock"
+# BASHPID of the shell that wrote the lock. $$ is not enough: it keeps the
+# parent's value inside the subshells that run the agents.
+LOCK_OWNER_PID=""
+# Background agent jobs of the phase in progress, for stop_agents.
+AGENT_PIDS=()
+
+# Remove the lock, but only from the process that took it and only while the
+# file still names this run. A subshell, or a run whose stale lock was replaced
+# by a newer review, must never delete a lock that is not its own.
+release_lock() {
+    [[ -n "$LOCK_OWNER_PID" && "$BASHPID" == "$LOCK_OWNER_PID" ]] || return 0
+    local holder
+    holder=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+    [[ "$holder" == "$$" ]] || return 0
+    rm -f "$LOCK_FILE"
+}
+
+# The given pids and every live descendant of them, one "pid@starttime" per
+# line. `ps -ef` has PID, PPID and STIME in columns 2, 3 and 5 on Linux, macOS
+# and Git Bash alike. The start time is carried so a pid can be recognised as
+# the same process later: Git Bash reuses pids within seconds.
+agent_tree() {
+    ps -ef 2>/dev/null | awk -v roots="$*" '
+        BEGIN { n = split(roots, r, " "); for (i = 1; i <= n; i++) want[r[i]] = 1 }
+        NR > 1 { pid[NR] = $2; ppid[NR] = $3; st[NR] = $5; dead[NR] = /<defunct>/ }
+        END {
+            do {
+                grew = 0
+                for (i in pid) if ((ppid[i] in want) && !(pid[i] in want)) {
+                    want[pid[i]] = 1; grew = 1
+                }
+            } while (grew)
+            for (i in pid) if ((pid[i] in want) && !dead[i]) print pid[i] "@" st[i]
+        }' || true
+}
+
+# Stop the agents of the phase in progress. The tracked pids are the subshells
+# running run_claude/run_codex; the CLI itself (and timeout) sits below them and
+# would survive as an orphan still writing into artifacts/, so the descendants
+# are collected first and signalled too. Tracked pids rather than `kill 0`: the
+# chunk driver runs this script inside a pipeline and shares its process group.
+#
+# The wait is bounded and ends in KILL instead of a plain `wait`: on Git Bash a
+# `timeout` whose child was signalled in the same instant can miss the child's
+# exit and sit there until its own deadline, and this must never keep the
+# script from exiting.
+stop_agents() {
+    [[ ${#AGENT_PIDS[@]} -gt 0 ]] || return 0
+    local tree now e survivors tries=0
+    tree=$(agent_tree "${AGENT_PIDS[@]}" | tr '\n' ' ')
+    for e in $tree; do
+        kill "${e%@*}" 2>/dev/null || true
+    done
+    while true; do
+        # Only what is still the same process (same pid AND start time) counts.
+        now=" $(ps -ef 2>/dev/null | awk 'NR > 1 && !/<defunct>/ { print $2 "@" $5 }' | tr '\n' ' ') "
+        survivors=""
+        for e in $tree; do
+            [[ "$now" == *" $e "* ]] && survivors+=" ${e%@*}"
+        done
+        [[ -z "$survivors" ]] && break
+        if [[ $tries -ge 3 ]]; then
+            # shellcheck disable=SC2086  # word splitting is the point
+            kill -9 $survivors 2>/dev/null || true
+            break
+        fi
+        sleep 1
+        tries=$((tries + 1))
+    done
+    AGENT_PIDS=()
+}
+
+# INT/TERM must end the run. The old single trap (`rm -f lock` on EXIT INT TERM)
+# removed the lock on a signal and then returned, so the review carried on with
+# nothing stopping a second one from starting. Exiting here runs the EXIT trap,
+# which is the only place the lock is released.
+on_signal() {
+    local sig="$1"
+    local code="$2"
+    trap '' INT TERM
+    log_error "Received $sig - stopping agents and exiting" >&2
+    stop_agents
+    exit "$code"
+}
 
 acquire_lock() {
     if [[ -f "$LOCK_FILE" ]]; then
@@ -1033,7 +1206,10 @@ acquire_lock() {
     fi
 
     echo $$ > "$LOCK_FILE"
-    trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
+    LOCK_OWNER_PID="$BASHPID"
+    trap release_lock EXIT
+    trap 'on_signal INT 130' INT
+    trap 'on_signal TERM 143' TERM
 }
 
 # A --dry-run writes stub artifacts to the same paths as a real run, so starting
@@ -1139,7 +1315,8 @@ run_review_loop() {
         local start_phase=1
         [[ $iteration -eq 1 ]] && start_phase=$FROM_PHASE
 
-        # Phase 1. Return codes: 0 = both clean, 1 = issues found, 2 = both agents dead.
+        # Phase 1. Return codes: 0 = both clean, 1 = issues found, 2 = both agents dead,
+        # 3 = nothing to review (collection failed or the dump holds no file).
         local phase_rc=0
         if [[ $start_phase -le 1 ]]; then
             run_phase_1 "$target_dir" "$iteration" || phase_rc=$?
@@ -1150,6 +1327,10 @@ run_review_loop() {
             elif [[ $phase_rc -eq 2 ]]; then
                 log_error "Halting: no usable agent output in phase 1"
                 update_tracking "status" "agent_failure"
+                return 1
+            elif [[ $phase_rc -eq 3 ]]; then
+                log_error "Halting: no source to review - no agent was called"
+                update_tracking "status" "empty_scope"
                 return 1
             fi
             echo ""
@@ -1164,6 +1345,10 @@ run_review_loop() {
             if [[ $phase_rc -eq 2 ]]; then
                 log_error "Halting: no usable agent output in phase 2"
                 update_tracking "status" "agent_failure"
+                return 1
+            elif [[ $phase_rc -eq 3 ]]; then
+                log_error "Halting: no source to review - phase 2 agents were not called"
+                update_tracking "status" "empty_scope"
                 return 1
             fi
             echo ""
@@ -1185,8 +1370,15 @@ run_review_loop() {
             log_info "Skipping phase 3 (resuming at phase $start_phase)"
         fi
 
-        # Phase 4
-        if run_phase_4 "$target_dir" "$iteration"; then
+        # Phase 4. Return codes: 0 = done, 1 = fixes applied, go round again,
+        # 2 = report-only synthesis produced no usable report.
+        phase_rc=0
+        run_phase_4 "$target_dir" "$iteration" || phase_rc=$?
+        if [[ $phase_rc -eq 2 ]]; then
+            log_error "Halting: synthesis failed - no report was produced"
+            update_tracking "status" "agent_failure"
+            return 1
+        elif [[ $phase_rc -eq 0 ]]; then
             if [[ "$NO_FIX" == "1" ]]; then
                 log_success "Report complete - no files were modified"
                 update_tracking "status" "report_only"
@@ -1279,7 +1471,8 @@ USAGE:
 OPTIONS:
     -h, --help              Show this help
     -m, --max-iters N       Max iterations (default: 3)
-    -p, --prompt FILE       Custom initial review prompt
+    -p, --prompt FILE       Custom initial review prompt, used for this run only
+                            (prompts/initial_review.md is left untouched)
     -v, --verbose           Verbose output
     -t, --timeout MIN       Timeout per agent in minutes (default: 10)
     --status                Show current status
@@ -1423,12 +1616,19 @@ main() {
         SOURCE_FILE_LIST="$(cd "$(dirname "$SOURCE_FILE_LIST")" && pwd)/$(basename "$SOURCE_FILE_LIST")"
     fi
 
-    check_dependencies
-
-    if [[ -n "$custom_prompt" ]] && [[ -f "$custom_prompt" ]]; then
-        cp "$custom_prompt" "$PROMPTS_DIR/initial_review.md"
-        log_info "Using custom prompt: $custom_prompt"
+    # -p replaces the phase-1 template for this run only. It used to be copied
+    # over prompts/initial_review.md, permanently, and a mistyped path was
+    # silently ignored.
+    if [[ -n "$custom_prompt" ]]; then
+        if [[ ! -f "$custom_prompt" ]]; then
+            log_error "Prompt file not found: $custom_prompt"
+            exit 1
+        fi
+        INITIAL_PROMPT_FILE="$(cd "$(dirname "$custom_prompt")" && pwd)/$(basename "$custom_prompt")"
+        log_info "Using custom prompt for this run: $INITIAL_PROMPT_FILE"
     fi
+
+    check_dependencies
 
     run_review_loop "$target_dir"
 }

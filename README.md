@@ -91,17 +91,30 @@ OPTIONS:
     --reset-circuit         Reset circuit breaker only
     --circuit-status        Show circuit breaker status
     --dry-run               Show what would happen without executing
+    --no-fix                Review only: phase 4 writes a report and modifies
+                            nothing. Runs a single iteration.
+    --from-phase N          Start the first iteration at phase N (1-4), reusing
+                            the artifacts already in artifacts/
+    --changed-only          Review only files with uncommitted git changes,
+                            included in full rather than truncated
 ```
 
 ## Project Structure
 
 ```
 adversarial-review/
-├── adversarial_review.sh    # Main script
+├── adversarial_review.sh    # Main script: one review of one target
+├── run_chunked_review.sh    # Reviews a large project chunk by chunk, from a manifest
+├── run_filelist_review.sh   # Same, with each chunk defined by a list of files
+├── supervise_review.sh      # Restarts the chunk driver until every chunk it would run is reviewed or empty
+├── scheduled_restart.sh     # Starts a chunked review at a given hour
+├── aggregate_review.sh      # Merges the per-chunk reports into REPORT.md and summary.json
 ├── lib/
 │   ├── date_utils.sh        # Cross-platform date utilities
 │   ├── circuit_breaker.sh   # Prevents runaway loops
-│   └── response_analyzer.sh # Parses agent outputs
+│   ├── transient.sh         # Decides whether a chunk was really reviewed
+│   └── response_analyzer.sh # Unused: sourced, but nothing calls it (the main script has its own parser)
+├── chunks/                  # Manifests and file lists for chunked reviews
 ├── prompts/
 │   ├── initial_review.md    # Phase 1: Independent review prompt
 │   ├── cross_review.md      # Phase 2: Cross-review prompt
@@ -199,7 +212,7 @@ Key findings from research:
 
 ## Cost Considerations
 
-Each iteration makes 6 API calls (3 parallel pairs):
+Each iteration makes 7 agent calls (3 parallel pairs, then one synthesis call):
 - Phase 1: 2 calls (Claude + Codex)
 - Phase 2: 2 calls (Claude + Codex)
 - Phase 3: 2 calls (Claude + Codex)

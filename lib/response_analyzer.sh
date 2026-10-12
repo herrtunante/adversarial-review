@@ -73,7 +73,8 @@ analyze_response() {
     local line_count=$(echo "$content" | wc -l | tr -d '[:space:]')
 
     # Generate hash of issues (for detecting same issues across iterations)
-    local issues_hash=$(echo "$content" | grep -iE "(issue|bug|problem|error|warning|should)" | sort | shasum -a 256 | cut -d' ' -f1)
+    # sha256_hash is the portable helper defined in adversarial_review.sh; shasum is often absent on Linux.
+    local issues_hash=$(echo "$content" | grep -iE "(issue|bug|problem|error|warning|should)" | sort | sha256_hash)
 
     # Output JSON
     cat << EOF

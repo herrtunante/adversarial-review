@@ -30,6 +30,23 @@ RUN_DIR="$(cd "$RUN_DIR" && pwd)"
 [[ -n "$OUT" ]] || OUT="$RUN_DIR/REPORT.md"
 SUMMARY_JSON="$RUN_DIR/summary.json"
 
+command -v jq > /dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
+
+# chunk_is_reviewed, latest_iter_artifact and artifact_has_block. The driver, the
+# supervisor and the file-list runner decide "is this chunk done?" with
+# chunk_is_reviewed; the report used its own weaker test and could tabulate a
+# chunk they had counted as failed.
+AGG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$AGG_SCRIPT_DIR/lib/transient.sh"
+
+# jq with Git Bash's argument rewriting switched off: a run directory or a
+# summary that starts with a slash would otherwise reach the native jq.exe
+# converted to a Windows path. Both variables are ignored everywhere else.
+# That jq.exe also ends its lines with CRLF, which is dropped so the output is
+# the same on every platform (jq escapes any CR inside a string, so none of
+# the ones removed here is data).
+jq_raw() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' jq "$@" | tr -d '\r'; }
+
 # Pull one KEY from a status block in an artifact. The block delimiters vary per
 # phase, so the caller passes the block name.
 status_value() {
@@ -53,14 +70,13 @@ num() { local v="${1:-}"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
 # directory exits non-zero, and under `set -e` that kills the whole script from
 # inside the command substitution - which made aggregating a partial run fail.
 find_synthesis() {
-    local d="$1"
+    local d="$1" f
     [[ -d "$d/artifacts" ]] || return 0
-    local f
-    f="$(find "$d/artifacts" -name 'iter*_4_synthesis.md' -type f 2>/dev/null | sort | tail -1 || true)"
-    # Only a report with a real status block counts. A refused or unreachable
-    # synthesis call leaves a one-line file, which would otherwise tabulate as a
-    # finished chunk with zero findings.
-    if [[ -n "$f" ]] && grep -q -- '---SYNTHESIS_STATUS---' "$f" 2>/dev/null; then
+    f="$(latest_iter_artifact "$d/artifacts" 4_synthesis.md)"
+    # Only a report with a complete status block counts. A refused or
+    # unreachable synthesis call leaves a one-line file, which would otherwise
+    # tabulate as a finished chunk with zero findings.
+    if [[ -n "$f" ]] && artifact_has_block "$f" SYNTHESIS_STATUS; then
         echo "$f"
     fi
     return 0
@@ -69,7 +85,14 @@ find_synthesis() {
 # Strip the status block out of a report body so the merged document reads as
 # prose; the counters are already tabulated above it.
 strip_status() {
-    sed '/---SYNTHESIS_STATUS---/,/---END_SYNTHESIS_STATUS---/d' "$1"
+    # sed's range runs to end of file when the closing delimiter is missing,
+    # which would delete the rest of the report. Leave an unterminated block
+    # where it is.
+    if artifact_has_block "$1" SYNTHESIS_STATUS; then
+        sed '/---SYNTHESIS_STATUS---/,/---END_SYNTHESIS_STATUS---/d' "$1"
+    else
+        cat "$1"
+    fi
 }
 
 chunk_dirs=()
@@ -83,24 +106,62 @@ done < <(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
 
 [[ ${#chunk_dirs[@]} -gt 0 ]] || { echo "no chunk directories under $RUN_DIR" >&2; exit 1; }
 
+# Chunks the driver gave up on have no directory: it deletes a chunk whose
+# agents were refused and records only an index.tsv row. Without them "N chunks,
+# M completed" overstates how much of the project was covered. The last row for
+# a chunk is its current state; "empty" means there was nothing in it to review.
+abandoned=()
+if [[ -f "$RUN_DIR/index.tsv" ]]; then
+    while IFS=$'\t' read -r a_id a_status; do
+        [[ -n "$a_id" && ! -d "$RUN_DIR/$a_id" ]] || continue
+        [[ "$a_status" == "empty" ]] && continue
+        abandoned+=("$a_id"$'\t'"$a_status")
+    done < <(tr -d '\r' < "$RUN_DIR/index.tsv" \
+             | awk -F'\t' 'NR > 1 && $1 != "" && $1 != "chunk_id" { if (!($1 in st)) order[++n] = $1; st[$1] = $4 }
+                           END { for (i = 1; i <= n; i++) printf "%s\t%s\n", order[i], st[order[i]] }')
+fi
+total_chunks=$(( ${#chunk_dirs[@]} + ${#abandoned[@]} ))
+
 tot_high=0; tot_med=0; tot_skip=0; tot_claude=0; tot_codex=0
 tot_rej_claude=0; tot_rej_codex=0; tot_files=0
 done_count=0
 pending=()
 rows=""
 json_chunks=""
+# Per chunk, in chunk_dirs order: pending | clean | done, and the report path.
+# Decided once here and reused for the findings section; chunk_is_reviewed
+# reads every artifact, which is slow where starting a process is (Windows).
+chunk_state=()
+chunk_synth=()
 
 for d in "${chunk_dirs[@]}"; do
     cid="$(basename "$d")"
-    synth="$(find_synthesis "$d")"
 
-    if [[ -z "$synth" || ! -f "$synth" ]]; then
+    # chunk_is_reviewed is the runners' own test: a chunk they would redo is
+    # not tabulated, whatever its synthesis file looks like.
+    if ! chunk_is_reviewed "$d"; then
+        chunk_state+=("pending"); chunk_synth+=("")
         rows+="| $cid | - | - | - | - | not reviewed yet |"$'\n'
-        json_chunks+="{\"chunk\":\"$cid\",\"status\":\"pending\"},"
+        json_chunks+="$(jq_raw -nc --arg chunk "$cid" '{chunk: $chunk, status: "pending"}')"$'\n'
         pending+=("$cid")
         continue
     fi
     done_count=$((done_count + 1))
+
+    synth="$(find_synthesis "$d")"
+    chunk_synth+=("$synth")
+    if [[ -z "$synth" ]]; then
+        # Reviewed, and no synthesis: both agents called the chunk clean in
+        # phase 1 and the run ended there.
+        chunk_state+=("clean")
+        summary="Clean: both agents reported no issues in phase 1, so there was no debate or synthesis"
+        rows+="| $cid | 0 | 0 | 0 | 0/0 | $summary |"$'\n'
+        json_chunks+="$(jq_raw -nc --arg chunk "$cid" --arg summary "$summary" \
+            '{chunk: $chunk, status: "clean", high: 0, medium: 0, skipped: 0, from_claude: 0, from_codex: 0,
+              rejected_claude: 0, rejected_codex: 0, summary: $summary}')"$'\n'
+        continue
+    fi
+    chunk_state+=("done")
 
     high=$(num "$(status_value "$synth" SYNTHESIS_STATUS HIGH_CONFIDENCE_FIXES)")
     med=$(num "$(status_value "$synth" SYNTHESIS_STATUS MEDIUM_CONFIDENCE_FIXES)")
@@ -119,11 +180,24 @@ for d in "${chunk_dirs[@]}"; do
     tot_files=$((tot_files + fmod))
 
     rows+="| $cid | $high | $med | $skip | ${fclaude}/${fcodex} | ${summary//|/\\|} |"$'\n'
-    esc_summary="$(printf '%s' "$summary" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-    json_chunks+="{\"chunk\":\"$cid\",\"high\":$high,\"medium\":$med,\"skipped\":$skip,\"from_claude\":$fclaude,\"from_codex\":$fcodex,\"rejected_claude\":$rclaude,\"rejected_codex\":$rcodex,\"summary\":\"$esc_summary\"},"
+    # Built by jq, not by hand: a tab or any other control character in a
+    # summary made the file invalid JSON.
+    json_chunks+="$(jq_raw -nc --arg chunk "$cid" --arg summary "$summary" \
+        --argjson high "$high" --argjson medium "$med" --argjson skipped "$skip" \
+        --argjson from_claude "$fclaude" --argjson from_codex "$fcodex" \
+        --argjson rejected_claude "$rclaude" --argjson rejected_codex "$rcodex" \
+        '{chunk: $chunk, high: $high, medium: $medium, skipped: $skipped, from_claude: $from_claude,
+          from_codex: $from_codex, rejected_claude: $rejected_claude, rejected_codex: $rejected_codex,
+          summary: $summary}')"$'\n'
 done
 
-json_chunks="${json_chunks%,}"
+for a in ${abandoned[@]+"${abandoned[@]}"}; do
+    a_id="${a%%$'\t'*}"; a_status="${a#*$'\t'}"
+    rows+="| $a_id | - | - | - | - | not reviewed (${a_status:-no status}, no chunk directory) |"$'\n'
+    json_chunks+="$(jq_raw -nc --arg chunk "$a_id" --arg run_status "$a_status" \
+        '{chunk: $chunk, status: "pending", run_status: $run_status}')"$'\n'
+    pending+=("$a_id")
+done
 
 {
     echo "# Adversarial Review - Consolidated Report"
@@ -131,7 +205,7 @@ json_chunks="${json_chunks%,}"
     echo "Run directory: \`$RUN_DIR\`"
     echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
     echo ""
-    echo "The project is split into ${#chunk_dirs[@]} chunks; $done_count of them have a completed review."
+    echo "The project is split into $total_chunks chunks; $done_count of them have a completed review."
     echo "Each completed chunk ran the full"
     echo "four-phase debate independently: Claude and Codex reviewed it in parallel,"
     echo "cross-reviewed each other's findings, defended or conceded in a meta-review,"
@@ -168,10 +242,11 @@ json_chunks="${json_chunks%,}"
         echo "Not reviewed yet: ${pending[*]}."
         echo ""
     fi
-    for d in "${chunk_dirs[@]}"; do
+    for i in "${!chunk_dirs[@]}"; do
+        d="${chunk_dirs[$i]}"
         cid="$(basename "$d")"
-        synth="$(find_synthesis "$d")"
-        [[ -n "$synth" ]] || continue
+        [[ "${chunk_state[$i]}" != "pending" ]] || continue
+        synth="${chunk_synth[$i]}"
         echo "### Chunk: $cid"
         echo ""
         if [[ -n "$synth" && -f "$synth" ]]; then
@@ -187,7 +262,7 @@ json_chunks="${json_chunks%,}"
             fi
             strip_status "$synth"
         else
-            echo "_No synthesis artifact was produced for this chunk. Check \`$d/console.log\`._"
+            echo "_Clean: both agents reported no issues in phase 1, so the run ended there and no synthesis was written._"
         fi
         echo ""
         echo "---"
@@ -202,30 +277,41 @@ json_chunks="${json_chunks%,}"
     echo "  working directory and could read further, but nothing required them to."
     echo "- **Truncation.** Files were cut to the first N lines fed to the collector."
     echo "  Long classes were reviewed only down to that line."
-    echo "- **Tests excluded.** \`src/test\` was filtered out of every chunk."
+    # Only the manifest driver filters tests, and it marks its chunks with
+    # exclude.regex. A file-list chunk (files.list) holds exactly the files it
+    # names, tests included if they were listed.
+    if compgen -G "$RUN_DIR/*/exclude.regex" > /dev/null; then
+        echo "- **Tests excluded.** \`src/test\` was filtered out of every chunk built from a manifest."
+    fi
     echo "- **Self-arbitration.** Phase 4 is run by Claude, one of the two debaters."
     echo "  The rejection counts above are the check on that bias, not a guarantee."
 } > "$OUT"
 
-cat > "$SUMMARY_JSON" <<JSON
-{
-  "run_dir": "$RUN_DIR",
-  "generated": "$(date -Iseconds 2>/dev/null || date)",
-  "chunks": ${#chunk_dirs[@]},
-  "chunks_done": $done_count,
-  "totals": {
-    "high_confidence": $tot_high,
-    "medium_confidence": $tot_med,
-    "skipped": $tot_skip,
-    "from_claude": $tot_claude,
-    "from_codex": $tot_codex,
-    "rejected_from_claude": $tot_rej_claude,
-    "rejected_from_codex": $tot_rej_codex,
-    "files_modified": $tot_files
-  },
-  "by_chunk": [$json_chunks]
-}
-JSON
+printf '%s' "$json_chunks" | jq_raw -s \
+    --arg run_dir "$RUN_DIR" --arg generated "$(date -Iseconds 2>/dev/null || date)" \
+    --argjson chunks "$total_chunks" --argjson chunks_done "$done_count" \
+    --argjson high "$tot_high" --argjson medium "$tot_med" --argjson skipped "$tot_skip" \
+    --argjson from_claude "$tot_claude" --argjson from_codex "$tot_codex" \
+    --argjson rej_claude "$tot_rej_claude" --argjson rej_codex "$tot_rej_codex" \
+    --argjson files_modified "$tot_files" \
+    '{
+       run_dir: $run_dir,
+       generated: $generated,
+       chunks: $chunks,
+       chunks_done: $chunks_done,
+       totals: {
+         high_confidence: $high,
+         medium_confidence: $medium,
+         skipped: $skipped,
+         from_claude: $from_claude,
+         from_codex: $from_codex,
+         rejected_from_claude: $rej_claude,
+         rejected_from_codex: $rej_codex,
+         files_modified: $files_modified
+       },
+       by_chunk: .
+     }' > "$SUMMARY_JSON.tmp"
+mv "$SUMMARY_JSON.tmp" "$SUMMARY_JSON"
 
 echo "report:  $OUT"
 echo "summary: $SUMMARY_JSON"

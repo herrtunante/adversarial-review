@@ -60,8 +60,17 @@ TARGET="$(cd "$TARGET" && pwd)"
 
 # Resolve the lists before the cd below, so relative paths mean what the caller typed.
 ABS_LISTS=()
+SEEN_IDS=" "
 for list in "${LISTS[@]}"; do
     [[ -f "$list" ]] || { echo "no file list: $list" >&2; exit 1; }
+    # The chunk id names a directory under the output that is deleted and rewritten, so it has to be
+    # a plain name, and two lists with the same file name would overwrite each other.
+    cid="$(basename "$list" .files)"
+    [[ "$cid" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ && "$cid" != *..* ]] \
+        || { echo "file list name gives an unusable chunk id '$cid': $list" >&2; exit 1; }
+    [[ "$SEEN_IDS" != *" $cid "* ]] \
+        || { echo "two file lists give the same chunk id '$cid': $list" >&2; exit 1; }
+    SEEN_IDS+="$cid "
     ABS_LISTS+=("$(cd "$(dirname "$list")" && pwd)/$(basename "$list")")
 done
 mkdir -p "$OUT"
@@ -110,6 +119,11 @@ for list in "${ABS_LISTS[@]}"; do
         if chunk_is_reviewed "$chunk_out"; then
             log "$chunk: done (exit $rc)"
             done_ok=1
+            break
+        fi
+        # Every listed path was missing, so there was nothing to review. Retrying cannot change that.
+        if [[ "$(jq -r '.status // ""' "$chunk_out/tracking.json" 2>/dev/null | tr -d '\r')" == "empty_scope" ]]; then
+            log "$chunk: nothing to review (empty scope), not retrying; check the paths in $list"
             break
         fi
         log "$chunk: no complete review (exit $rc), see $OUT/$chunk.attempt$attempt.log"
