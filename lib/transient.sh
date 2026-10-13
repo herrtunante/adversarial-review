@@ -97,11 +97,18 @@ artifact_is_transient_failure() {
        && { artifact_is_failure_note "$f" || ! artifact_has_real_answer "$f"; }; then
         return 0
     fi
-    if grep -qa -- "$TRANSIENT_CODEX_BANNER" "$f" 2>/dev/null \
+    # A Codex transcript opens with the banner. Looking for it anywhere misfired on a genuine review that
+    # QUOTED the banner and a quota phrase - which is what reviewing this tool's own source produces: a full
+    # report was thrown away and the chunk redone.
+    if head -n 5 "$f" 2>/dev/null | grep -qa -- "$TRANSIENT_CODEX_BANNER" \
        && grep -qEi -- "$TRANSIENT_SHORT_RE" "$f" 2>/dev/null; then
         return 0
     fi
-    grep -qEi -- "$TRANSIENT_LOG_RE" "$f" 2>/dev/null
+    # Transport errors are timestamped log lines. For the same reason they only count in a transcript, a
+    # failure note, or a file that is not a real answer: a review can quote one in a code block.
+    grep -qEi -- "$TRANSIENT_LOG_RE" "$f" 2>/dev/null \
+        && { head -n 5 "$f" 2>/dev/null | grep -qa -- "$TRANSIENT_CODEX_BANNER" \
+             || artifact_is_failure_note "$f" || ! artifact_has_real_answer "$f"; }
 }
 
 # Did any agent in this chunk fail for a reason that goes away on its own - an exhausted quota or a dropped
