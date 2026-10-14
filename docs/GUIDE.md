@@ -215,7 +215,12 @@ the file name.
 bash run_filelist_review.sh --target ../whisp -o reviews/whisp chunks/whisp/*.files
 ```
 
-Re-running the same command skips chunks that are already done.
+Re-running the same command skips chunks that are already done, as long as their
+scope is unchanged. If you edit a file list or a manifest include, or point
+`--target` somewhere else, the affected chunks are reviewed again with a warning
+saying what changed. Changes to the source code itself never force a redo. The
+supervisor does not notice a changed scope, so after editing a manifest run the
+driver itself with `--resume`.
 
 ### 5.3 Unattended runs that survive quota limits
 
