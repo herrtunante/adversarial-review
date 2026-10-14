@@ -1,0 +1,13 @@
+{
+  "name": "herrtunante-tools",
+  "owner": {
+    "name": "herrtunante"
+  },
+  "plugins": [
+    {
+      "name": "adversarial-review",
+      "source": "./",
+      "description": "Claude + Codex adversarial code review: two models review, cross-check and agree on a report."
+    }
+  ]
+}

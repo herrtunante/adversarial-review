@@ -142,8 +142,16 @@ archived_scope_change() {
     return 1
 }
 
-# All state lives next to the script, whatever directory this was started from.
-cd "$SCRIPT_DIR" || exit 1
+# All state lives in one directory, whatever directory this was started from: next to the script unless
+# AR_STATE_DIR says otherwise (see adversarial_review.sh, which reads the same variable). Exported so every review
+# started below uses it. The paths taken from the command line were made absolute above.
+STATE_DIR="${AR_STATE_DIR:-$SCRIPT_DIR}"
+if ! mkdir -p "$STATE_DIR" 2>/dev/null || ! cd "$STATE_DIR"; then
+    echo "AR_STATE_DIR is not a usable directory: $STATE_DIR" >&2
+    exit 1
+fi
+STATE_DIR="$(pwd)"
+export AR_STATE_DIR="$STATE_DIR"
 
 # --- driver lock ---------------------------------------------------------------
 #
@@ -153,7 +161,7 @@ cd "$SCRIPT_DIR" || exit 1
 # either creates it or fails with nothing in between; the pid inside says who
 # holds it. adversarial_review.sh refuses to start under a live lock unless
 # AR_DRIVER_LOCK_PID says the holder started it.
-DRIVER_LOCK="$SCRIPT_DIR/.driver.lock"
+DRIVER_LOCK="$STATE_DIR/.driver.lock"
 DRIVER_LOCK_HELD=0
 REVIEW_PID=""
 

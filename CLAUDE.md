@@ -29,15 +29,27 @@ shellcheck adversarial_review.sh lib/*.sh            # Lint, if installed
 ```
 
 `docs/GUIDE.md` is the user guide. When a user asks you to *run* a review (rather than change
-this repo), follow the `adversarial-review` skill in `.claude/skills/adversarial-review/SKILL.md`;
+this repo), follow the `adversarial-review` skill in `skills/adversarial-review/SKILL.md`;
 `AGENTS.md` points Codex to the same runbook. Keep the three consistent when flags or outputs change.
+
+The repo is also a Claude Code plugin and its own marketplace (`.claude-plugin/plugin.json` and
+`marketplace.json`, marketplace name `herrtunante-tools`). Plugins load skills only from
+`skills/`, so that is the real skill; `.claude/skills/adversarial-review/SKILL.md` is a pointer
+to it, so a clone still gets `/adversarial-review`. The skill works out in its step 0 whether it
+was loaded as a plugin, because Claude Code replaces `${CLAUDE_PLUGIN_ROOT}` and
+`${CLAUDE_PLUGIN_DATA}` in a plugin skill's text with real paths and leaves them alone otherwise.
+An installed plugin runs from a cache directory that every update replaces, which is why the
+skill sets `AR_STATE_DIR` to the plugin's data directory. Check the manifests with
+`claude plugin validate ./`; `--strict` fails on two warnings that are deliberate: no `version`
+(so each commit is an update) and this file sitting at the plugin root.
 
 Report-only is the default since the self-review of October 2026; fixing needs `--fix` (or
 `NO_FIX=0`), and `--no-fix` is still accepted. A report-only run is one iteration, 7 agent calls.
 `-m` and `-t` must be positive integers, and a flag missing its value is an error.
 
 Env vars override the flags: `MAX_ITERATIONS`, `TIMEOUT_MINUTES`, `VERBOSE=1`, `DRY_RUN=1`,
-`NO_FIX` (0 or 1), `FROM_PHASE`, `CODEX_BIN` (used as given; the run stops if it does not answer
+`NO_FIX` (0 or 1), `FROM_PHASE`, `AR_STATE_DIR` (where the state below lives; default the
+script's own directory; the drivers pass it on, and their default `reviews/` output moves with it), `CODEX_BIN` (used as given; the run stops if it does not answer
 `--version`), `FIX_MODE_TOOLS` (the tool list for fix mode), `READ_ONLY_TOOLS` (the tool list for
 every other Claude call), the collector settings `MAX_SOURCE_FILES`, `MAX_SOURCE_LINES`,
 `MAX_SOURCE_SHELL_FILES`, `MAX_SOURCE_SHELL_LINES` (positive integers, checked at startup),
@@ -519,7 +531,8 @@ per-agent counters assume exactly two reviewers.
 `tracking.json` (iteration, status, target, append-only `history[]`), `.circuit_breaker.json`,
 `.circuit_breaker_history.json`, `.response_analysis.json`, `artifacts/` (with `scope.stamp`),
 `logs/` (with `*.codex.log` and `*.claude.log`), and the locks `.review.lock`,
-`.review.lock.recover/` and `.driver.lock/` — all gitignored and regenerated. `artifacts/iter{N}_{phase}_{agent}_{type}.md` is the naming convention.
+`.review.lock.recover/` and `.driver.lock/` — all gitignored and regenerated, and all kept in
+`AR_STATE_DIR` when it is set. `artifacts/iter{N}_{phase}_{agent}_{type}.md` is the naming convention.
 
 ## Reference
 

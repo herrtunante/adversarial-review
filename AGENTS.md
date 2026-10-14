@@ -8,8 +8,9 @@ the internals in full; read it before changing any script or prompt.
 
 ## When asked to run a review
 
-Follow `.claude/skills/adversarial-review/SKILL.md` step by step. It is written for
-Claude Code but applies unchanged to you. In short:
+Follow `skills/adversarial-review/SKILL.md` step by step. It is written for
+Claude Code but applies unchanged to you; in its step 0 you are in the "clone of the
+repository" case. In short:
 
 - Report-only unless the user explicitly asks for fixes; never add `--fix` yourself.
 - Start every run detached (`nohup ... > reviews/<run>.log 2>&1 &`): a run takes

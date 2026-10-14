@@ -79,7 +79,11 @@ claude --version && codex --version && jq --version
 ```
 
 All state (artifacts, logs, locks) lives inside this repository's directory, so
-the tool never writes into the project you review unless you use `--fix`.
+the tool never writes into the project you review unless you use `--fix`. Set
+`AR_STATE_DIR=/some/dir` to keep it somewhere else instead; the chunk driver and
+the file-list wrapper pass it on to every review they start, and their default
+output folder `reviews/` moves with it. Two runs with different state directories
+are independent, like two worktrees.
 
 ## 3. Your first review
 
@@ -305,36 +309,65 @@ in the background, watching it, and turning the report into a short answer (and
 fixes, if you ask). A nested `claude --print` started from inside a Claude Code
 session works, so Claude Code can run the review directly.
 
-### 8.1 The built-in skill
+### 8.1 Install the skill as a plugin (recommended)
 
-This repository ships a skill, `.claude/skills/adversarial-review/SKILL.md`, that
-tells Claude exactly how to operate the tool: preflight checks, choosing the
-scope, always starting detached with `nohup`, checking on the run, collecting the
-report, verifying the top findings, and the safety rules (report-only unless you
-say otherwise, never `--reset` during a run, one run per checkout, ask before
-spending quota on a chunked run).
-
-Open Claude Code **in this repository** and either type the command:
+The repository is also a Claude Code **plugin** with its own marketplace, so you
+can install the skill and the scripts it runs in one step, and use it from any
+project. In Claude Code:
 
 ```text
-/adversarial-review ../my-project
+/plugin marketplace add herrtunante/adversarial-review
+/plugin install adversarial-review@herrtunante-tools
 ```
 
-or just ask in plain words; the skill is picked up from its description:
+or from a terminal:
+
+```bash
+claude plugin marketplace add herrtunante/adversarial-review
+claude plugin install adversarial-review@herrtunante-tools
+```
+
+The skill tells Claude exactly how to operate the tool: preflight checks,
+choosing the scope, always starting detached with `nohup`, checking on the run,
+collecting the report, verifying the top findings, and the safety rules
+(report-only unless you say otherwise, never `--reset` during a run, one run at a
+time, ask before spending quota on a chunked run).
+
+Invoke it as `/adversarial-review:adversarial-review ../my-project` (plugin skills
+carry the plugin's name in front), or just ask in plain words; the skill is
+picked up from its description:
 
 ```text
 Run an adversarial review of ../my-project and tell me what it finds.
 Review only my uncommitted changes in ../my-project.
 Plan chunks for ../collect, show me the plan, then run it overnight.
 How is the review going?
-Summarize reviews/collect/REPORT.md and check the top three findings against the code.
+Summarize the last report and check the top three findings against the code.
 Fix findings 1 and 4 from that report in ../my-project.
 ```
 
-If you work from another repository, you can either start Claude there with this
-repository added (`claude --add-dir ../adversarial-review`) and mention it, or
-copy the skill folder into `~/.claude/skills/` so it is available everywhere.
-The skill expects the commands to run from this repository's directory.
+Where things go when it is installed as a plugin:
+
+- **The scripts** are in Claude Code's plugin cache. Every update replaces that
+  copy, so nothing is kept there.
+- **Run state** (`artifacts/`, `logs/`, locks, `tracking.json`) goes to the
+  plugin's data directory, which survives updates. The skill passes it to the
+  scripts as `AR_STATE_DIR`.
+- **Reports and logs** go to `~/adversarial-reviews/`, unless you name another
+  place. Manifests and file lists you write with Claude go to
+  `~/adversarial-reviews/chunks/`.
+
+The plugin has no version number, so `/plugin update` (or the automatic update)
+brings in each new commit on `main`. You still need `codex`, `jq` and a logged-in
+Claude on the machine (section 2).
+
+### 8.1b Using the skill from a clone
+
+In a clone of this repository the same skill is available as plain
+`/adversarial-review`, through a short pointer in `.claude/skills/` that loads
+`skills/adversarial-review/SKILL.md`. There, state and reports stay inside the
+clone as described in the rest of this guide. To try the plugin build of a local
+checkout without installing it, run `claude --plugin-dir .` from the clone.
 
 ### 8.2 Fewer permission prompts
 
@@ -533,7 +566,9 @@ bash run_filelist_review.sh --target ../proj -o reviews/proj chunks/proj/*.files
 bash aggregate_review.sh reviews/proj
 
 # through an agent
-/adversarial-review ../proj                           # in Claude Code, in this repo
+/plugin install adversarial-review@herrtunante-tools   # once, after /plugin marketplace add herrtunante/adversarial-review
+/adversarial-review:adversarial-review ../proj        # installed as a plugin
+/adversarial-review ../proj                           # in a clone of this repo
 claude -p "Use the adversarial-review skill on ../proj ..." --allowedTools ...
 codex exec --sandbox danger-full-access "Follow AGENTS.md: review ../proj ..."
 ```

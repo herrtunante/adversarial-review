@@ -49,6 +49,16 @@ Two AI agents (Claude and GPT Codex) independently review code, then critique ea
 reviews of large projects, reading the report, and running the whole thing through
 Claude Code (`/adversarial-review`) or Codex instead of by hand.
 
+**Install as a Claude Code plugin** (skill and scripts in one step, usable from any project):
+
+```text
+/plugin marketplace add herrtunante/adversarial-review
+/plugin install adversarial-review@herrtunante-tools
+```
+
+Then ask Claude to "run an adversarial review of ../my-project". You still need
+`codex` and `jq` installed (see Requirements).
+
 ```bash
 # Clone or copy to your workspace
 cd adversarial-review

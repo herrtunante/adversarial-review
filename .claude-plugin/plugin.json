@@ -1,0 +1,11 @@
+{
+  "name": "adversarial-review",
+  "description": "Claude and Codex review a project's code independently, verify each other's findings, and agree on a report. The skill plans the scope, runs the review in the background, and summarizes the result.",
+  "author": {
+    "name": "herrtunante"
+  },
+  "homepage": "https://github.com/herrtunante/adversarial-review",
+  "repository": "https://github.com/herrtunante/adversarial-review",
+  "license": "MIT",
+  "keywords": ["code-review", "codex", "multi-agent", "debate"]
+}

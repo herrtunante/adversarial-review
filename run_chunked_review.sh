@@ -29,6 +29,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REVIEW_SH="$SCRIPT_DIR/adversarial_review.sh"
 
+# Where the reviews keep their state (artifacts/, logs/, tracking.json, the
+# locks) and where the default output goes: next to the scripts unless
+# AR_STATE_DIR says otherwise. See adversarial_review.sh, which reads the same
+# variable; it is exported so every review started below uses this directory.
+# Made absolute here but only created under "--- run ---": --list creates nothing.
+STATE_DIR="${AR_STATE_DIR:-$SCRIPT_DIR}"
+case "$STATE_DIR" in
+    /*) ;;
+    *)  STATE_DIR="$PWD/$STATE_DIR" ;;
+esac
+[[ -d "$STATE_DIR" ]] && STATE_DIR="$(cd "$STATE_DIR" && pwd)"
+export AR_STATE_DIR="$STATE_DIR"
+
 TARGET_ROOT=""
 OUT_DIR=""
 TIMEOUT_MIN=20
@@ -50,7 +63,7 @@ BASE_EXCLUDE_FILES='[.]min[.](js|css)$'
 
 # State next to the scripts is global, so only one driver or wrapper may work in
 # this checkout at a time. See acquire_driver_lock.
-DRIVER_LOCK="$SCRIPT_DIR/.driver.lock"
+DRIVER_LOCK="$STATE_DIR/.driver.lock"
 DRIVER_LOCK_HELD=0
 
 RED=$'\033[0;31m'
@@ -137,7 +150,7 @@ unset MAX_SOURCE_FILES MAX_SOURCE_LINES MAX_SOURCE_SHELL_FILES MAX_SOURCE_SHELL_
 # The output directory is only named here. It is created after the --list block:
 # planning must not leave an empty reviews/<name>-<timestamp>/ behind every time.
 if [[ -z "$OUT_DIR" ]]; then
-    OUT_DIR="$SCRIPT_DIR/reviews/$(basename "$TARGET_ROOT")-$(date +%Y%m%d-%H%M%S)"
+    OUT_DIR="$STATE_DIR/reviews/$(basename "$TARGET_ROOT")-$(date +%Y%m%d-%H%M%S)"
 fi
 
 # Escape a path fragment for use inside an extended-regex alternation.
@@ -837,6 +850,10 @@ if [[ "$LIST_ONLY" == "1" ]]; then
 fi
 
 # --- run ---------------------------------------------------------------------
+if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+    err "AR_STATE_DIR is not a usable directory: $STATE_DIR"
+    exit 1
+fi
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
@@ -957,15 +974,15 @@ for i in "${!IDS[@]}"; do
     # the lock alone - and refuse to start the chunk at all while someone holds
     # it, rather than trampling their run. (.driver.lock, taken above, keeps out
     # other drivers; this check is for a review someone started by hand.)
-    if [[ -f "$SCRIPT_DIR/.review.lock" ]]; then
-        holder="$(cat "$SCRIPT_DIR/.review.lock" 2>/dev/null || echo "")"
+    if [[ -f "$STATE_DIR/.review.lock" ]]; then
+        holder="$(cat "$STATE_DIR/.review.lock" 2>/dev/null || echo "")"
         if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
             err "another review is running (pid $holder) - stopping before it corrupts this run"
             err "wait for it to finish, then resume with --resume"
             exit 4
         fi
         warn "removing stale lock left by pid ${holder:-unknown}"
-        rm -f "$SCRIPT_DIR/.review.lock"
+        rm -f "$STATE_DIR/.review.lock"
     fi
 
     # The archive step below copies INTO the chunk directory, so whatever an
@@ -989,19 +1006,19 @@ for i in "${!IDS[@]}"; do
     printf '%s\n' "$exclude" > "$chunk_out/exclude.regex"
     printf '%s\n' "$scope_def" > "$chunk_out/scope.def"
 
-    rm -rf "${SCRIPT_DIR:?}/artifacts"/* 2>/dev/null || true
-    rm -f "${SCRIPT_DIR:?}/logs"/iter* 2>/dev/null || true
-    rm -f "${SCRIPT_DIR:?}/tracking.json" 2>/dev/null || true
+    rm -rf "${STATE_DIR:?}/artifacts"/* 2>/dev/null || true
+    rm -f "${STATE_DIR:?}/logs"/iter* 2>/dev/null || true
+    rm -f "${STATE_DIR:?}/tracking.json" 2>/dev/null || true
     "$REVIEW_SH" --reset-circuit > /dev/null 2>&1 || true
 
     # A salvaged debate goes back into artifacts/ AFTER the clear above, so the
     # resumed run finds exactly the six files --from-phase 4 expects.
     # The scope stamp goes with them: --from-phase refuses to resume without it.
     if [[ "$resume_phase" -gt 1 && -n "$salvage_dir" && -d "$salvage_dir" ]]; then
-        mkdir -p "$SCRIPT_DIR/artifacts" "$SCRIPT_DIR/logs"
-        cp "$salvage_dir"/*.md "$SCRIPT_DIR/artifacts/" 2>/dev/null || true
-        cp "$salvage_dir"/scope.stamp "$SCRIPT_DIR/artifacts/" 2>/dev/null || true
-        cp "$salvage_dir"/*.codex.log "$SCRIPT_DIR/logs/" 2>/dev/null || true
+        mkdir -p "$STATE_DIR/artifacts" "$STATE_DIR/logs"
+        cp "$salvage_dir"/*.md "$STATE_DIR/artifacts/" 2>/dev/null || true
+        cp "$salvage_dir"/scope.stamp "$STATE_DIR/artifacts/" 2>/dev/null || true
+        cp "$salvage_dir"/*.codex.log "$STATE_DIR/logs/" 2>/dev/null || true
         info "$cid: restored saved debate, resuming at phase $resume_phase"
     fi
 
@@ -1043,9 +1060,9 @@ for i in "${!IDS[@]}"; do
     dur=$(($(date +%s) - start))
 
     # Archive everything this chunk produced before the next chunk wipes it.
-    [[ -d "$SCRIPT_DIR/artifacts" ]] && cp -r "$SCRIPT_DIR/artifacts" "$chunk_out/" 2>/dev/null || true
-    [[ -d "$SCRIPT_DIR/logs" ]] && cp -r "$SCRIPT_DIR/logs" "$chunk_out/" 2>/dev/null || true
-    [[ -f "$SCRIPT_DIR/tracking.json" ]] && cp "$SCRIPT_DIR/tracking.json" "$chunk_out/" || true
+    [[ -d "$STATE_DIR/artifacts" ]] && cp -r "$STATE_DIR/artifacts" "$chunk_out/" 2>/dev/null || true
+    [[ -d "$STATE_DIR/logs" ]] && cp -r "$STATE_DIR/logs" "$chunk_out/" 2>/dev/null || true
+    [[ -f "$STATE_DIR/tracking.json" ]] && cp "$STATE_DIR/tracking.json" "$chunk_out/" || true
 
     # A quota refusal is not a review. Throw the chunk away, wait for the CLI to
     # answer again, and redo it - otherwise the loop races through every

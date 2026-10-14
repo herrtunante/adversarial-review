@@ -31,8 +31,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$SCRIPT_DIR/lib"
 PROMPTS_DIR="$SCRIPT_DIR/prompts"
 
+# Where a run keeps its state: artifacts/, logs/, tracking.json, the circuit
+# breaker and the locks. Next to the script unless AR_STATE_DIR says otherwise.
+# Installed as a Claude Code plugin, the script lives in a cache directory that
+# every plugin update replaces, so the plugin's skill points this at a directory
+# that survives updates. Two runs with different state directories do not see
+# each other's locks, exactly like two git worktrees. Exported (and made
+# absolute) so the reviews a chunk driver starts use the same one.
+AR_STATE_DIR="${AR_STATE_DIR:-$SCRIPT_DIR}"
+if ! mkdir -p "$AR_STATE_DIR" 2>/dev/null || ! AR_STATE_DIR="$(cd "$AR_STATE_DIR" && pwd)"; then
+    echo "[ERROR] AR_STATE_DIR is not a usable directory: $AR_STATE_DIR" >&2
+    exit 1
+fi
+export AR_STATE_DIR
+
 # Export AR_DIR for lib scripts
-export AR_DIR="$SCRIPT_DIR"
+export AR_DIR="$AR_STATE_DIR"
 ARTIFACTS_DIR="$AR_DIR/artifacts"
 LOGS_DIR="$AR_DIR/logs"
 TRACKING_FILE="$AR_DIR/tracking.json"
