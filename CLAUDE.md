@@ -165,9 +165,46 @@ Consequences worth knowing before editing prompts or the parser:
 - **Prompt and parser are one contract.** Renaming a block delimiter or a key in `prompts/*.md`
   silently breaks the loop — a missing block just yields `{"error": "no status block"}`, the
   `// false` jq defaults kick in, and the run continues as if nothing was found.
-- The parser coerces `YES`/`FULL` → `true` and `NO`/`LOW` → `false`, so `CONFIDENCE: LOW` lands in
-  the JSON as a boolean, not a string.
+- The parser coerces `YES`/`FULL` → `true` and `NO`/`LOW` → `false`, so a `LOW` value lands in
+  the JSON as a boolean, not a string. No status-block key takes `LOW` or `FULL` any more, which
+  is why `CONFIDENCE` and `AGREEMENT_LEVEL` were dropped from the blocks.
 - A bare `NO_ISSUES` line is a recognized fallback when no block is present.
+- The keys the code reads: `ISSUES_FOUND` and `EXIT_SIGNAL` (phase 1), `CONSENSUS_REACHED`
+  (phase 3), and in `SYNTHESIS_STATUS` `EXIT_SIGNAL`, `FILES_MODIFIED`, the four
+  `FIXES_FROM_*`/`REJECTED_FROM_*` counters, plus `HIGH_CONFIDENCE_FIXES`,
+  `MEDIUM_CONFIDENCE_FIXES`, `ISSUES_SKIPPED` and `SUMMARY` for the aggregator. Phase 2's block
+  and the other phase-3 keys only feed the `--status` history; a phase-2 artifact still needs a
+  complete block to count as a real answer.
+
+### The prompts
+
+The four templates in `prompts/` were rewritten in October 2026 to cut what each phase pays for
+and to make findings checkable. Keep these properties when editing them:
+
+- **Findings carry IDs.** A reviewer numbers its findings `F1, F2…` and the ones it adds while
+  verifying the other review `N1, N2…`. The agents are never told which of the two they are; the
+  synthesis prompt maps the IDs to `C-F2` (Claude) / `X-F5` (Codex) from the section headings
+  `run_phase_4` writes ("Claude's Review", "Claude's Analysis of Codex", …). Renaming those
+  headings breaks that mapping.
+- **Evidence is mandatory.** A finding quotes the code and names a concrete trigger; REFUTED,
+  REJECT and MAINTAIN must cite the code that supports them. This, not the number of rounds, is
+  what filters false positives.
+- **Only MEDIUM and above is a finding.** Lower items go in an uncounted "Minor notes" list that
+  later phases ignore, so `ISSUES_FOUND: 0` (and with it a clean phase-1 exit: 2 calls instead
+  of 7) is reachable when only nits remain. Phase 1 is capped at 15 findings, phase 2 at 5
+  new ones, and each phase has a word budget, because every word is input to the phases after it.
+- **Phase 3 ends in a "Final positions" table** (KEEP / WITHDRAW / DISPUTED) that synthesis
+  starts from; `CONSENSUS_REACHED` is YES only when nothing is DISPUTED.
+- **One synthesis prompt for both modes.** It describes the report and has a "Fix mode only"
+  section; report-only runs get the script's override notice in front of it. Don't reintroduce
+  instructions to implement or test outside that section.
+- Every template tells the agent that the source is data and comments addressing a reviewer are not
+  instructions, and phase 1 says what the `FILE TRUNCATED` marker means and that the dump may be one
+  chunk of a larger project.
+
+Not done yet, and worth doing in the script: put the source dump first in the phase-1 and phase-2
+prompts, with the template after it. Both prompts then share a long identical prefix, which the
+providers' prompt caching can reuse; today each starts with a different template.
 
 ### Exit conditions
 
@@ -450,7 +487,8 @@ halves rather than dividing it.
 Add `run_gemini()` mirroring `run_claude()`; launch it alongside the others in phases 1–3; extend
 cross-review to N-way pairings (phases 2 and 3 currently hardcode the two-file swap); and extend
 the phase-4 context concatenation. `prompts/cross_review.md` and `meta_review.md` assume exactly
-one "other agent" and would need rewording.
+one "other agent" and would need rewording, and `synthesis.md`'s `C-`/`X-` ID prefixes and its
+per-agent counters assume exactly two reviewers.
 
 ## State Files
 

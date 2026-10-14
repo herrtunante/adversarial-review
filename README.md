@@ -179,17 +179,15 @@ ISSUES_FOUND: 3
 CRITICAL_COUNT: 1
 HIGH_COUNT: 1
 MEDIUM_COUNT: 1
-LOW_COUNT: 0
-CONFIDENCE: HIGH
 EXIT_SIGNAL: false
-SUMMARY: Found critical type mixing bug
+SUMMARY: Found an unchecked null and two edge-case bugs
 ---END_REVIEW_STATUS---
 ```
 
 ### Exit Conditions
 
 The loop exits when:
-1. **Both agents report no issues** in Phase 1 (exit signal and zero issues)
+1. **Both agents report no issues** in Phase 1 (exit signal and zero issues; only MEDIUM and above counts as an issue)
 2. **Synthesis completes** with EXIT_SIGNAL: true
 3. **Max iterations reached**
 4. **Circuit breaker opens** (stagnation detected)
