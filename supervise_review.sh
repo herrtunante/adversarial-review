@@ -108,19 +108,57 @@ say() { echo "[supervise] $(date '+%m-%d %H:%M') $*" | tee -a "$SUPLOG" >> "$LOG
 # Is a driver for this output directory alive?
 #
 # Git Bash's ps prints every script as a bare /usr/bin/bash, so the real command
-# lines are read from /proc. Only processes whose command line starts with
-# "bash" count: the tool shells that launched a driver stay alive as its parent
-# and carry the same text inside a `bash -c "source ..."` string.
+# lines are read from /proc, one NUL-separated argument at a time. Only processes
+# whose first argument is bash count: the tool shells that launched a driver stay
+# alive as its parent and carry the same text inside a `bash -c "source ..."`
+# string. A driver is one with run_chunked_review.sh as an argument, and its
+# output directory is the value of its last -o or --out.
+#
+# That value is compared as a whole path, not as text inside the command line:
+# matched as a substring, reviews/run1 also matched a driver for reviews/run10,
+# and the supervisor waited for hours on someone else's run. A relative value is
+# resolved against that process's own working directory, so a driver in another
+# worktree with the same relative -o is not taken for ours, and the comparison
+# is by file identity (-ef), so a short 8.3 spelling of a Windows path matches
+# the long one. A directory that cannot be found is compared by its spelling.
+driver_out_is_ours() {
+    local raw="$1" cwd="$2" path=""
+    # Absolute: /c/..., or a Windows C:/... or C:\... (a backslash in a bracket
+    # expression does not match here, hence the separate test).
+    if [[ "$raw" == /* ]] || [[ "$raw" == [A-Za-z]:* && ( "${raw:2:1}" == / || "${raw:2:1}" == '\' ) ]]; then
+        path="$raw"
+    elif [[ -n "$cwd" ]]; then
+        path="$cwd/$raw"
+    fi
+    if [[ -n "$path" && -d "$path" ]]; then
+        [[ "$path" -ef "$OUT" ]]
+        return
+    fi
+    [[ "$raw" == "$OUT" || "$raw" == "$OUT_ARG" ]]
+}
+
 driver_running() {
-    local p c
+    local p arg prev n is_driver out_raw cwd
     for p in /proc/[0-9]*; do
-        c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
-        case "$c" in
-            *shell-snapshots*) continue ;;
-            # Either spelling of the output directory: this script hands the driver the absolute one, a driver
-            # started by hand may have been given the relative one.
-            bash\ *run_chunked_review.sh*"$OUT"*|bash\ *run_chunked_review.sh*"$OUT_ARG"*) return 0 ;;
-        esac
+        [[ -r "$p/cmdline" ]] || continue
+        n=0; prev=""; is_driver=0; out_raw=""
+        while IFS= read -r -d '' arg; do
+            n=$((n + 1))
+            if (( n == 1 )); then
+                [[ "${arg##*/}" == bash || "${arg##*/}" == bash.exe ]] || break
+            elif [[ "$arg" == *shell-snapshots* ]]; then
+                is_driver=0
+                break
+            elif (( is_driver == 0 )) && [[ "${arg##*/}" == run_chunked_review.sh ]]; then
+                is_driver=1
+            elif (( is_driver == 1 )) && [[ "$prev" == -o || "$prev" == --out ]]; then
+                out_raw="$arg"
+            fi
+            prev="$arg"
+        done 2>/dev/null < "$p/cmdline"
+        (( is_driver == 1 )) && [[ -n "$out_raw" ]] || continue
+        cwd="$(readlink "$p/cwd" 2>/dev/null)" || cwd=""
+        driver_out_is_ours "$out_raw" "$cwd" && return 0
     done
     return 1
 }

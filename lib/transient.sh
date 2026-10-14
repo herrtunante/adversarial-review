@@ -222,15 +222,38 @@ chunk_hit_transient_failure() {
     chunk_iteration_hit_transient_failure "$chunk_out" "${n:-0}"
 }
 
+# Is file $1 a debate artifact (phase 1, 2 or 3, named iter<N>_<phase>_...) that is not an answer to its phase?
+# Each phase's prompt ends in its own status block: REVIEW_STATUS, CROSS_REVIEW_STATUS, META_REVIEW_STATUS.
+# Phase 1 may also answer with the bare NO_ISSUES line parse_status_block accepts. A CLI that exits 0 with "I need
+# more information before reviewing", or with a reply cut off before its block, wrote neither; such a file used
+# to pass as one side of the debate, and the chunk counted as reviewed on the strength of the synthesis alone.
+# The block must be the phase's own: a phase-3 reply ending in a REVIEW_STATUS block answered the wrong prompt.
+# Phase 4 and files with any other name are never judged here (returns 1); the synthesis has its own checks.
+artifact_lacks_phase_block() {
+    local f="$1" name="${1##*/}"
+    [[ -f "$f" ]] || return 1
+    [[ "$name" =~ ^iter[0-9]+_([123])_ ]] || return 1
+    case "${BASH_REMATCH[1]}" in
+        1) artifact_has_block "$f" REVIEW_STATUS && return 1
+           grep -qE '^[[:space:]]*NO_ISSUES[[:space:]]*$' "$f" 2>/dev/null && return 1 ;;
+        2) artifact_has_block "$f" CROSS_REVIEW_STATUS && return 1 ;;
+        3) artifact_has_block "$f" META_REVIEW_STATUS && return 1 ;;
+    esac
+    return 0
+}
+
 # A failed agent call of any kind, transient or not: the two shapes above, either agent's failure note (a
-# timeout is exit code 124 and matches no quota pattern), or an artifact with nothing in it. Wider than
-# artifact_is_transient_failure on purpose - that one decides whether waiting for the quota is worth it, this one
-# decides whether the debate had both agents in it.
+# timeout is exit code 124 and matches no quota pattern), an artifact with nothing in it, or a phase 1-3 reply
+# that is not an answer to its phase (artifact_lacks_phase_block). Wider than artifact_is_transient_failure on
+# purpose - that one decides whether waiting for the quota is worth it, this one decides whether the debate had
+# both agents in it. A reply with no block is a failed call but not a transient one: retrying it right away is
+# the right response, not waiting out a quota.
 artifact_is_failed_call() {
     local f="$1"
     [[ -f "$f" ]] || return 1
     [[ -s "$f" ]] || return 0
     artifact_is_failure_note "$f" && return 0
+    artifact_lacks_phase_block "$f" && return 0
     artifact_is_transient_failure "$f"
 }
 

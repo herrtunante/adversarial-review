@@ -74,7 +74,7 @@ usage() {
     echo "  -m, --max-iters N  iterations per chunk (default: 1)"
     echo "  --fix              allow phase 4 to modify the target (default: review only)"
     echo "  --only GLOB        run only chunks whose id matches GLOB"
-    echo "  --resume           skip chunks that already completed in --out"
+    echo "  --resume           skip chunks already reviewed in --out with the same scope"
     echo "  --list             print the resolved chunk plan with sizes, run nothing"
     echo "  --dry-run          stub every agent call"
     echo "  --max-files N      per-language file cap handed to the collector (default: 200)"
@@ -472,6 +472,71 @@ stamp_names_target() {
     [[ "$first" == "$target" ]]
 }
 
+# What a chunk's scope is, in a form that changes only when the scope does: the
+# canonical module root, the always-on exclusions and the normalised include
+# paths ("." for the whole module), sorted because their order in the manifest
+# does not matter. Archived as scope.def next to exclude.regex.
+#
+# exclude.regex itself is not a good test of "same scope": build_exclude lists
+# the sibling directories that exist at the moment it runs, so a build that
+# creates target/ in a module changes the regex while the chunk covers exactly
+# the same files, and every reviewed chunk of that module would be redone.
+chunk_scope_def() {
+    local module_abs="$1"
+    shift
+    printf 'module %s\n' "$module_abs"
+    printf 'base %s\n' "$(base_exclude "$module_abs")"
+    if [[ $# -eq 0 ]]; then
+        printf 'include .\n'
+        return 0
+    fi
+    printf '%s\n' "$@" | sed -e 's/^$/./' -e 's/^/include /' | LC_ALL=C sort -u
+}
+
+# Was the archived review in $1 of a different scope from the one this chunk has
+# now? Prints what changed and returns 0 if so; returns 1 when it is the same.
+# A --resume used to skip any chunk chunk_is_reviewed accepted, so after an edit
+# to the manifest or a different --target with the same -o, the old report was
+# kept and published as the review of the new scope.
+#
+# Three tests, in order:
+# - artifacts/scope.stamp, line 1, is the target the review was run against.
+#   The source hash on line 2 is deliberately not compared: a change to the code
+#   must not redo finished chunks, or every commit during a long run would.
+# - scope.def, when the chunk has one, against this chunk's definition now.
+# - otherwise (a chunk archived before scope.def existed) exclude.regex, byte
+#   for byte after dropping CRs. That regex starts with the module root, so it
+#   also checks the target of a chunk that has no scope stamp either.
+archived_scope_change() {
+    local chunk_out="$1" module_abs="$2" exclude="$3" def="$4"
+    local stamp="$1/artifacts/scope.stamp" first="" old_mod old_inc new_inc
+    if [[ -f "$stamp" ]] && ! stamp_names_target "$stamp" "$module_abs"; then
+        IFS= read -r first < "$stamp" || true
+        echo "it was a review of ${first%$'\r'}, the chunk is now $module_abs"
+        return 0
+    fi
+    if [[ -f "$chunk_out/scope.def" ]]; then
+        [[ "$(tr -d '\r' < "$chunk_out/scope.def")" == "$def" ]] && return 1
+        old_mod="$(tr -d '\r' < "$chunk_out/scope.def" | sed -n 's/^module //p')"
+        old_inc="$(tr -d '\r' < "$chunk_out/scope.def" | sed -n 's/^include //p' | paste -sd, -)"
+        new_inc="$(printf '%s\n' "$def" | sed -n 's/^include //p' | paste -sd, -)"
+        if [[ "$old_mod" != "$module_abs" ]]; then
+            echo "its module root was $old_mod, now $module_abs"
+        elif [[ "$old_inc" != "$new_inc" ]]; then
+            echo "its include paths were $old_inc, now $new_inc"
+        else
+            echo "the driver's always-on exclusions have changed since"
+        fi
+        return 0
+    fi
+    if [[ -f "$chunk_out/exclude.regex" ]] \
+       && [[ "$(tr -d '\r' < "$chunk_out/exclude.regex")" == "$exclude" ]]; then
+        return 1
+    fi
+    echo "its exclude.regex differs from the one the manifest gives now"
+    return 0
+}
+
 # Same choice as get_timeout_cmd in adversarial_review.sh: gtimeout where
 # coreutils is installed under that name (macOS), else timeout, else nothing.
 get_timeout_cmd() {
@@ -807,17 +872,7 @@ for i in "${!IDS[@]}"; do
     selected=$((selected + 1))
 
     chunk_out="$OUT_DIR/$cid"
-    if [[ "$RESUME" == "1" ]] && chunk_is_complete "$chunk_out"; then
-        info "$cid: already done, skipping"
-        continue
-    fi
-    # A dry run only writes stubs. It must not replace a real review: the old
-    # output of this chunk is removed below, before the first attempt.
-    if [[ "$DRY_RUN" == "1" ]] && chunk_is_complete "$chunk_out"; then
-        err "$cid: refusing to dry-run over a completed review in $chunk_out"
-        failed=$((failed + 1))
-        continue
-    fi
+    scope_redo=0
 
     module_abs="$TARGET_ROOT/${MODULES[$i]}"
     if [[ ! -d "$module_abs" ]]; then
@@ -834,6 +889,29 @@ for i in "${!IDS[@]}"; do
         continue
     fi
     exclude="$(build_exclude "$module_abs" "${incs[@]}")"
+    scope_def="$(chunk_scope_def "$module_abs" "${incs[@]}")"
+
+    # Decided here, once the chunk's scope is known, and not from the chunk
+    # directory alone: a reviewed chunk is reused only if it was a review of
+    # this same scope (see archived_scope_change).
+    if [[ "$RESUME" == "1" || "$DRY_RUN" == "1" ]] && chunk_is_complete "$chunk_out"; then
+        if [[ "$RESUME" == "1" ]]; then
+            if why="$(archived_scope_change "$chunk_out" "$module_abs" "$exclude" "$scope_def")"; then
+                warn "$cid: the archived review is of another scope ($why) - reviewing the chunk again"
+                scope_redo=1
+            else
+                info "$cid: already done, skipping"
+                continue
+            fi
+        fi
+        # A dry run only writes stubs. It must not replace a real review: the
+        # old output of this chunk is removed below, before the first attempt.
+        if [[ "$DRY_RUN" == "1" ]]; then
+            err "$cid: refusing to dry-run over a completed review in $chunk_out"
+            failed=$((failed + 1))
+            continue
+        fi
+    fi
     read -r nf kb < <(chunk_stats "$module_abs" "$exclude")
 
     echo "${BOLD}=== [$((i + 1))/${#IDS[@]}] $cid  ($nf files, ${kb}K) ===${NC}"
@@ -898,7 +976,7 @@ for i in "${!IDS[@]}"; do
     # --resume. A saved debate is not affected: it lives beside the directory.
     # Done after the lock check above, so a refused start deletes nothing.
     if [[ -d "$chunk_out" ]]; then
-        if [[ "$attempt" -eq 1 ]]; then
+        if [[ "$attempt" -eq 1 && "$scope_redo" -eq 0 ]]; then
             if [[ "$RESUME" == "1" ]]; then
                 warn "$cid: previous attempt incomplete, re-running"
             else
@@ -909,6 +987,7 @@ for i in "${!IDS[@]}"; do
     fi
     mkdir -p "$chunk_out"
     printf '%s\n' "$exclude" > "$chunk_out/exclude.regex"
+    printf '%s\n' "$scope_def" > "$chunk_out/scope.def"
 
     rm -rf "${SCRIPT_DIR:?}/artifacts"/* 2>/dev/null || true
     rm -f "${SCRIPT_DIR:?}/logs"/iter* 2>/dev/null || true
@@ -1046,6 +1125,11 @@ for i in "${!IDS[@]}"; do
             break
         fi
         if [[ "$redo" == "transient" ]] && ! wait_for_agents; then
+            # The chunk directory was removed above, so without a row this chunk
+            # would vanish from the report: aggregate_review.sh finds chunks by
+            # their directory or their index row. Rows are append-only and the
+            # last one counts, so a later --resume replaces this one.
+            printf "%s\t%s\t%s\t%s\t0\t0\n" "$cid" "$nf" "$kb" "transient_failure" >> "$INDEX"
             err "agent CLI did not recover - stopping the run; resume with --resume"
             exit 3
         fi

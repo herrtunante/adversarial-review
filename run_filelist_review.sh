@@ -17,8 +17,9 @@
 #
 # Use this instead of run_chunked_review.sh when a manifest cannot express the
 # split: the code sits in one directory, or the files are scattered across
-# directories or repos. A chunk that already has a full review is skipped, so
-# running the same command again resumes. Always report-only (--no-fix).
+# directories or repos. A chunk that already has a full review of the same list
+# and target is skipped, so running the same command again resumes. Always
+# report-only (--no-fix).
 #
 # Simpler than the chunk driver: it retries a refused agent a few times but does
 # not wait out a long quota reset, and it does not salvage a finished debate.
@@ -41,7 +42,7 @@ RETRY_WAIT=300
 LISTS=()
 
 usage() {
-    sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,29p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -110,6 +111,36 @@ OUT="$(cd "$OUT" && pwd)"
 . "$SCRIPT_DIR/lib/transient.sh"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# Was the archived review in $1 of a different scope from the list $2 against --target? Prints what changed and
+# returns 0 if so, returns 1 when it is the same. Skipping on chunk_is_reviewed alone reused the old report after
+# the list was edited or --target changed, as long as -o and the list's file name stayed the same.
+#
+# Line 1 of artifacts/scope.stamp is the target the review ran against; its source hash on line 2 is deliberately
+# not compared, so a change to the code does not redo finished chunks. files.list is the scope, compared byte for
+# byte after dropping CRs. A chunk reviewed before scope stamps existed has none: it is reused on its file list,
+# with a note that its target could not be checked.
+archived_scope_change() {
+    local chunk_out="$1" list="$2" stamp="$1/artifacts/scope.stamp" first=""
+    if [[ -f "$stamp" ]]; then
+        IFS= read -r first < "$stamp" || true
+        first="${first%$'\r'}"
+        if [[ "$first" != "$TARGET" ]]; then
+            echo "it was a review of $first, --target is now $TARGET"
+            return 0
+        fi
+    fi
+    if [[ ! -f "$chunk_out/files.list" ]]; then
+        echo "it has no files.list to compare with"
+        return 0
+    fi
+    if [[ "$(tr -d '\r' < "$chunk_out/files.list")" != "$(tr -d '\r' < "$list")" ]]; then
+        echo "its file list differs from $list"
+        return 0
+    fi
+    [[ -f "$stamp" ]] || log "$(basename "$chunk_out"): reviewed before scope stamps existed - its file list matches, its target cannot be checked" >&2
+    return 1
+}
 
 # All state lives next to the script, whatever directory this was started from.
 cd "$SCRIPT_DIR" || exit 1
@@ -209,8 +240,12 @@ for list in "${ABS_LISTS[@]}"; do
     chunk="$(basename "$list" .files)"
     chunk_out="$OUT/$chunk"
     if chunk_is_reviewed "$chunk_out"; then
-        log "$chunk: already reviewed, skipping"
-        continue
+        if why="$(archived_scope_change "$chunk_out" "$list")"; then
+            log "$chunk: the archived review is of another scope ($why) - reviewing it again"
+        else
+            log "$chunk: already reviewed, skipping"
+            continue
+        fi
     fi
 
     attempt=1

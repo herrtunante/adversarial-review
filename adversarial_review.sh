@@ -403,13 +403,22 @@ collect_changed_files() {
         return 1
     fi
 
-    abs_target="$(cd "$target_dir" && pwd)"
+    # Reached from the repo root that git reports, as every changed file is
+    # below, so both sides are in the same path form. Taken from $target_dir
+    # itself, a target given through a mount (Git Bash's /tmp) never matched
+    # the drive form git reports, and every file was "outside the target".
+    local prefix
+    prefix=$(git -C "$target_dir" rev-parse --show-prefix 2>/dev/null) || prefix=""
+    abs_target="$(cd "$repo_root/$prefix" 2>/dev/null && pwd -P)" || {
+        log_error "--changed-only: cannot resolve $target_dir inside $repo_root" >&2
+        return 1
+    }
     log_verbose "Collecting changed files (repo root: $repo_root)"
 
     # NUL-delimited records, every untracked file listed individually. The plain
     # format reports a new directory as one "dir/" entry, which is not a file,
     # so everything inside it was dropped; it also C-quotes unusual names.
-    local entry xy rel path canon
+    local entry xy rel path canon in_target
     while IFS= read -r -d '' entry; do
         xy="${entry:0:2}"
         rel="${entry:3}"
@@ -419,6 +428,13 @@ collect_changed_files() {
         fi
         [[ -z "$rel" ]] && continue
         path="$repo_root/$rel"
+        # A symlink is never followed: one inside the target can point at any
+        # file on the machine, and dump_file would send that file to both
+        # agents. The directory walk (find -type f) skips links as well.
+        if [[ -L "$path" ]]; then
+            log_verbose "Skipping symlink: $rel"
+            continue
+        fi
         [[ -f "$path" ]] || continue
 
         case "${rel##*.}" in
@@ -429,12 +445,35 @@ collect_changed_files() {
         esac
 
         # Normalise to the shell's path form before comparing; git may report a
-        # Windows-style root while $PWD is POSIX-style.
-        canon="$(cd "$(dirname "$path")" 2>/dev/null && pwd)" || continue
+        # Windows-style root while $PWD is POSIX-style. pwd -P resolves links,
+        # on both sides, so a file reached through a linked directory is
+        # judged by where it really is.
+        canon="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || continue
         case "$canon/" in
             "$abs_target"/*) ;;
             *) log_verbose "Skipping (outside target): $rel"; continue ;;
         esac
+
+        # The same exclusions as the directory walk. Changed files used to be
+        # dumped whatever they were: an untracked .env.local, or a vendored
+        # tree the user had excluded, went to both external agents. The path
+        # filters are tested relative to the target, as walk_target does, so a
+        # target that itself sits under a hidden or build directory still
+        # yields its files; MAX_SOURCE_EXCLUDE sees the target path the walk
+        # would print plus that relative path.
+        in_target="${canon#"$abs_target"}/${path##*/}"
+        in_target="${in_target#/}"
+        case "/$in_target" in
+            */.?*|*/node_modules/*|*/target/*|*/build/*|*/__pycache__/*|*/venv/*)
+                log_verbose "Skipping (filtered path): $rel"
+                continue
+                ;;
+        esac
+        if [[ -n "$MAX_SOURCE_EXCLUDE" ]] \
+           && grep -Eq -- "$MAX_SOURCE_EXCLUDE" <<< "$target_dir/$in_target"; then
+            log_verbose "Skipping (MAX_SOURCE_EXCLUDE): $rel"
+            continue
+        fi
 
         log_verbose "Including changed file: $rel"
         output+="$(dump_file "$rel" "$path" "$max_lines")"$'\n'
@@ -611,7 +650,7 @@ run_claude() {
             # your session limit", which none of those words matches, and the
             # network failures name an errno. Lines are cut so the note stays
             # under TRANSIENT_SHORT_MAX_BYTES.
-            grep -aiE "error|limit|quota|refus|timed out|overloaded|resets [0-9]|reach the API|ENOTFOUND|EAI_AGAIN|ECONN|ETIMEDOUT|disconnected" "$claude_log" 2>/dev/null | tail -n 5 | cut -c 1-240
+            grep -aiE "error|limit|quota|refus|timed out|overloaded|resets [0-9]|reach the API|ENOTFOUND|EAI_AGAIN|ECONN|ETIMEDOUT|disconnected" "$claude_log" 2>/dev/null | tail -n 5 | cut -c 1-240 || true
         } > "$output_file"
         [[ $exit_code -eq 0 ]] && exit_code=1
     fi
@@ -704,11 +743,24 @@ run_codex() {
             echo "CODEX PRODUCED NO FINAL MESSAGE (exit code $exit_code)"
             echo
             echo "Matching lines from the transcript $codex_log :"
-            grep -aiE "error|usage limit|rate.?limit|quota|refus|timed out" "$codex_log" 2>/dev/null | tail -n 5
+            # Each quoted line is cut, as in run_claude's note, and the note is
+            # capped as a whole below: one long JSON or rg line in the
+            # transcript pushed it past TRANSIENT_SHORT_MAX_BYTES, and a quota
+            # refusal was then retried at once instead of waited out. `|| true`:
+            # under pipefail a grep that matched nothing ended run_codex here,
+            # leaving the note half written and the real exit code unreported.
+            grep -aiE "error|usage limit|rate.?limit|quota|refus|timed out" "$codex_log" 2>/dev/null | tail -n 5 | cut -c 1-200 || true
             echo
             echo "Last lines of the transcript:"
-            tail -n 3 "$codex_log" 2>/dev/null
+            tail -n 3 "$codex_log" 2>/dev/null | cut -c 1-200 || true
         } > "$output_file"
+        # 8 cut lines plus the headers can still exceed the limit when the log
+        # path is long. head reads the file, not a pipe, so pipefail is not
+        # involved; the first line is far shorter than the cap and survives.
+        if [[ $(wc -c < "$output_file") -gt 1800 ]]; then
+            head -c 1800 "$output_file" > "$output_file.cut" && mv -f "$output_file.cut" "$output_file"
+            echo >> "$output_file"
+        fi
         [[ $exit_code -eq 0 ]] && exit_code=1
     fi
 
@@ -784,12 +836,18 @@ wait_for_agents() {
 # its failure note was then handed to the other agent as "the review to
 # analyse": the run ended report_only, exit 0, with one voice in it. True when
 # any phase 1-3 artifact of iteration $1 is a failed call (an empty file, an
-# agent's failure note, or a quota/network refusal - lib/transient.sh). A
-# dry-run stub is none of those.
+# agent's failure note, a quota/network refusal, or a reply without its
+# phase's status block - lib/transient.sh). A dry-run stub has no status block
+# by design, so in a dry run the stub lines run_claude/run_codex write are
+# skipped here; the library's rule itself is not relaxed.
 iteration_has_failed_call() {
     local f
     for f in "$ARTIFACTS_DIR"/iter"$1"_[123]_*.md; do
         [[ -f "$f" ]] || continue
+        if [[ "$DRY_RUN" == "1" ]] \
+           && grep -qFx -e "DRY RUN: Claude output" -e "DRY RUN: Codex output" "$f" 2>/dev/null; then
+            continue
+        fi
         if artifact_is_failed_call "$f"; then
             log_error "Failed agent call: $f"
             return 0
@@ -834,11 +892,20 @@ target_state_hash() {
     local dir="$1"
     if git -C "$dir" rev-parse --git-dir &> /dev/null; then
         {
-            git -C "$dir" rev-parse HEAD || true
-            git -C "$dir" status --porcelain
-            git -C "$dir" diff
-            git -C "$dir" diff --cached
-            (cd "$dir" && git ls-files -z --others --exclude-standard | xargs -0 -r cksum) || true
+            # Everything is limited to the target. A target is often a
+            # subdirectory of a larger repository (a chunk's module), and any
+            # change elsewhere in it, during the synthesis call, read as
+            # progress in fix mode and as "the target changed" in report-only
+            # mode. HEAD:./ is the committed tree of the target directory
+            # itself, so a commit touching only other directories leaves it
+            # alone; it fails while the target is not in HEAD yet, which
+            # prints nothing and stays stable. ls-files lists only files under
+            # its working directory.
+            git -C "$dir" rev-parse HEAD:./ || true
+            git -C "$dir" status --porcelain --untracked-files=all -- .
+            git -C "$dir" diff -- .
+            git -C "$dir" diff --cached -- .
+            (cd "$dir" && git ls-files -z --others --exclude-standard -- . | xargs -0 -r cksum) || true
         } 2>/dev/null | sha256_hash
     else
         echo "no-git"
@@ -1583,9 +1650,11 @@ verify_resume_artifacts() {
         # 200 bytes is well under any real review and well over a one-line
         # refusal such as "You have hit your session limit".
         # The note run_claude/run_codex leave for a failed call is longer than
-        # that and is no review either.
+        # that and is no review either, nor is a reply without its phase's
+        # status block: artifact_is_failed_call is the same test the run loop
+        # and chunk_is_reviewed apply.
         if [[ ! -s "$ARTIFACTS_DIR/$f" ]] || [[ $(wc -c < "$ARTIFACTS_DIR/$f") -lt 200 ]] \
-           || artifact_is_failure_note "$ARTIFACTS_DIR/$f"; then
+           || artifact_is_failed_call "$ARTIFACTS_DIR/$f"; then
             missing+=("$f")
         fi
     done
@@ -2143,6 +2212,15 @@ main() {
     for cap_name in MAX_SOURCE_FILES MAX_SOURCE_LINES MAX_SOURCE_SHELL_FILES MAX_SOURCE_SHELL_LINES; do
         if ! [[ "${!cap_name}" =~ ^[1-9][0-9]*$ ]]; then
             log_error "$cap_name must be a positive integer, got '${!cap_name}'"
+            exit 1
+        fi
+    done
+    # The breaker compares its counters with these in [[ -ge ]], which reads
+    # 08 as a bad octal number (fatal) and 010 as 8, and would evaluate any
+    # other text as arithmetic. Same rule as the caps, so no leading zero.
+    for cap_name in CB_NO_PROGRESS_THRESHOLD CB_DISAGREEMENT_THRESHOLD CB_SAME_ISSUES_THRESHOLD; do
+        if ! [[ "${!cap_name}" =~ ^[1-9][0-9]{0,8}$ ]]; then
+            log_error "$cap_name must be a positive integer without leading zeros, got '${!cap_name}'"
             exit 1
         fi
     done

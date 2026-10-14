@@ -177,8 +177,12 @@ Consequences worth knowing before editing prompts or the parser:
   (phase 3), and in `SYNTHESIS_STATUS` `EXIT_SIGNAL`, `FILES_MODIFIED`, the four
   `FIXES_FROM_*`/`REJECTED_FROM_*` counters, plus `HIGH_CONFIDENCE_FIXES`,
   `MEDIUM_CONFIDENCE_FIXES`, `ISSUES_SKIPPED` and `SUMMARY` for the aggregator. Phase 2's block
-  and the other phase-3 keys only feed the `--status` history; a phase-2 artifact still needs a
-  complete block to count as a real answer.
+  and the other phase-3 keys only feed the `--status` history. Every phase 1-3 artifact still
+  needs a complete block of ITS phase to count as a real answer (`REVIEW_STATUS` for phase 1, or a
+  bare `NO_ISSUES` line; `CROSS_REVIEW_STATUS` for phase 2; `META_REVIEW_STATUS` for phase 3).
+  `artifact_lacks_phase_block` in `lib/transient.sh` enforces it, and `artifact_is_failed_call`
+  calls it, so the run loop, `--from-phase` and `chunk_is_reviewed` all reject a reply that is not
+  a review ("I need more information", or an answer cut off before its block).
 
 ### The prompts
 
@@ -226,9 +230,10 @@ A CLOSED → HALF_OPEN → OPEN state machine, fed exactly once per iteration by
 grounded in observable state rather than agent self-report, because each was previously either
 unfalsifiable or dead:
 
-- **Progress** — whether `target_state_hash` (a hash of `HEAD`, `git status --porcelain`, the staged
-  and unstaged diffs and the content of untracked files in the target) changed across phase 4, so a
-  commit by the agent or an edit to an untracked file counts. `FILES_MODIFIED` from the synthesis block
+- **Progress** — whether `target_state_hash` (a hash of the target's tree at `HEAD`, and
+  `git status --porcelain`, the staged and unstaged diffs and the content of untracked files, all
+  limited to the target directory with `-- .`) changed across phase 4, so a commit by the agent or
+  an edit to an untracked file counts, and a change elsewhere in the same repository does not. `FILES_MODIFIED` from the synthesis block
   is logged for comparison but no longer drives the breaker; it is self-reported, and a missing
   status block parses to `0`, which read as a stall on what was really a parse failure. Non-git
   targets fall back to the self-report with a warning.
@@ -251,8 +256,8 @@ start of a run whose target differs from the previous one, unless the breaker is
 ### Agent failure handling
 
 `wait_for_agents` replaces the old `wait $pid || true`. Exit codes are no longer discarded, and a
-debate needs both agents: after each of phases 1 to 3, one failed call (a failure note or an empty
-artifact) halts the run with `status: agent_failure` and exit 1, instead of passing the failure note
+debate needs both agents: after each of phases 1 to 3, one failed call (a failure note, an empty
+artifact, or a reply without its phase's status block) halts the run with `status: agent_failure` and exit 1, instead of passing the failure note
 on as "the other agent's review". A synthesis that fails, or writes no complete status block, ends
 the same way in both modes, before the breaker is fed and before another iteration starts. A Codex
 call that exits non-zero always leaves the failure note, even if it wrote a partial answer.
@@ -282,7 +287,11 @@ size and cost.
 
 `MAX_SOURCE_EXCLUDE` is an extended regex matched against each **absolute** path; matches are
 dropped *before* the cap applies, so vendored or generated trees don't consume the file budget.
-This is the only scoping lever the collector has — it can subtract but never restrict to a subtree,
+`--changed-only` applies the same exclusions as the walk (the regex, and the hidden, `node_modules`,
+`target`, `build`, `__pycache__` and `venv` filters relative to the target) and skips symlinks and
+any path that resolves outside the target; it used to send excluded or hidden files such as
+`.env.local` to the agents.
+The exclude regex is the only scoping lever the collector has — it can subtract but never restrict to a subtree,
 which is why `run_chunked_review.sh` has to enumerate the complement of what it wants to keep.
 
 `SOURCE_FILE_LIST` is the other lever, and the only one that restricts: it names a file holding one
@@ -326,7 +335,8 @@ the driver removes and rewrites, and ids must be unique. `run_filelist_review.sh
 rule to the list file names it takes its ids from.
 
 The driver exits 0 only when every selected chunk is reviewed or was recorded as empty, 1 for bad
-arguments or a bad manifest, 2 when one or more chunks failed, 3 when the agents did not recover from a quota wait, 4 when
+arguments or a bad manifest, 2 when one or more chunks failed, 3 when the agents did not recover from a quota wait (the chunk is
+then written to `index.tsv` as `transient_failure`, so the report still counts it), 4 when
 another driver holds the lock, and 130 or 143 on INT or TERM. It used to exit 0 regardless. Its
 verdict for a chunk is `chunk_is_reviewed`, not the review's exit code: a reviewed chunk whose
 review exited non-zero (a `--fix` chunk ending at `max_iterations`) is done, with the code noted in
@@ -372,7 +382,13 @@ connection error, an empty file, or the `CODEX PRODUCED NO FINAL MESSAGE` / `CLA
 OUTPUT` note an agent call leaves when it gives no answer, whatever the cause. A failure in an
 earlier iteration of a `--fix` run no longer counts once a later iteration is complete. A chunk both agents found
 clean in phase 1 has no synthesis; it counts through `status: clean` in its `tracking.json`.
-`--resume` redoes any chunk the function rejects.
+`--resume` redoes any chunk the function rejects, and any reviewed chunk whose archived scope differs from the
+current one: the target in its `scope.stamp`, and its `scope.def` (module root, base exclusions and
+normalised include paths, written into every chunk folder; older chunks fall back to comparing
+`exclude.regex`). A change of the SOURCE never forces a redo, or every commit during a long run
+would redo finished chunks. Old archives such as `reviews/collect-full` use an older exclude format,
+so resuming them redoes every chunk. The supervisor counts done chunks with `chunk_is_reviewed`
+alone, so after changing a manifest run the driver itself with `--resume`.
 
 Besides that, the driver has these reasons to redo a chunk:
 
@@ -417,7 +433,9 @@ removed by hand.
 For an unattended run, start `supervise_review.sh` instead of the driver. The driver gives up after
 two hours without a working agent CLI, which an overnight quota reset or a sleeping laptop easily
 exceeds. The supervisor restarts it with `--resume` until `chunk_is_reviewed` accepts every chunk the
-driver would run, and waits for any driver already running rather than starting a second. It
+driver would run, and waits for any driver already running rather than starting a second. A driver counts as
+running for this output only when its whole `-o` path, resolved against that driver's own working
+directory, is the same folder: `reviews/run1` no longer matches a driver for `reviews/run10`. It
 respects `--only`, does not count chunks the driver recorded as empty, and gives up on chunks that
 still fail after two extra passes. `--target`, `-o` and the manifest are resolved from the
 directory it was started in. It decides from the exit code of the driver it last ran,
@@ -440,7 +458,9 @@ runs still draw on the same Claude session quota.
 
 When a manifest cannot express the split (all the code is in one directory, or the files are
 scattered across directories or repos), use `run_filelist_review.sh` with one `SOURCE_FILE_LIST`
-file per chunk. It archives each chunk the same way, skips chunks `chunk_is_reviewed` accepts, and
+file per chunk. It archives each chunk the same way, skips chunks `chunk_is_reviewed` accepts whose
+`files.list` and stamped target still match (a chunk from before the stamp existed is reused when
+its list matches), and
 runs `aggregate_review.sh` at the end. It is report-only and simpler than the driver: a few retries
 per chunk, no waiting out a quota reset, no salvage. It takes the same `.driver.lock` (exit 4 if a
 driver or another wrapper holds it, and also for a live `.review.lock`), does not retry a chunk

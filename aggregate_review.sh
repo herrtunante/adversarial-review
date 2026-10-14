@@ -75,7 +75,11 @@ status_value() {
         END { gsub(/^[ \t\r]+|[ \t\r]+$/, "", v); print v }' <<< "$body" || true
 }
 
-num() { local v="${1:-}"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
+# A counter as a canonical non-negative integer, 0 for anything else. Leading zeros
+# are read in base 10 and dropped: bash arithmetic takes 010 for octal 8 and stops
+# the script on 08, and jq --argjson rejects both. At most nine digits, so the
+# value and the totals stay far inside the shell's integer range.
+num() { local v="${1:-}"; [[ "$v" =~ ^[0-9]{1,9}$ ]] && echo "$((10#$v))" || echo 0; }
 
 # Locate a chunk's phase-4 report, tolerating a chunk that has not run yet.
 #

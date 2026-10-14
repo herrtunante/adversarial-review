@@ -103,7 +103,8 @@ OPTIONS:
     --from-phase N          Start the first iteration at phase N (1-4), reusing
                             the artifacts already in artifacts/
     --changed-only          Review only files with uncommitted git changes,
-                            up to 3000 lines each
+                            up to 3000 lines each; excluded, hidden and
+                            symlinked files are skipped
 ```
 
 ## Project Structure
