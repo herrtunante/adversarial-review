@@ -45,6 +45,10 @@ Two AI agents (Claude and GPT Codex) independently review code, then critique ea
 
 ## Quick Start
 
+**The full user guide is [docs/GUIDE.md](docs/GUIDE.md)**: setup, scoping, chunked
+reviews of large projects, reading the report, and running the whole thing through
+Claude Code (`/adversarial-review`) or Codex instead of by hand.
+
 ```bash
 # Clone or copy to your workspace
 cd adversarial-review

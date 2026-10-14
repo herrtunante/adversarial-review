@@ -28,6 +28,10 @@ bash -n adversarial_review.sh lib/*.sh               # Syntax check (fastest smo
 shellcheck adversarial_review.sh lib/*.sh            # Lint, if installed
 ```
 
+`docs/GUIDE.md` is the user guide. When a user asks you to *run* a review (rather than change
+this repo), follow the `adversarial-review` skill in `.claude/skills/adversarial-review/SKILL.md`;
+`AGENTS.md` points Codex to the same runbook. Keep the three consistent when flags or outputs change.
+
 Report-only is the default since the self-review of October 2026; fixing needs `--fix` (or
 `NO_FIX=0`), and `--no-fix` is still accepted. A report-only run is one iteration, 7 agent calls.
 `-m` and `-t` must be positive integers, and a flag missing its value is an error.
