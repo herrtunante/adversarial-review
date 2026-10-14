@@ -99,7 +99,7 @@ OPTIONS:
     --from-phase N          Start the first iteration at phase N (1-4), reusing
                             the artifacts already in artifacts/
     --changed-only          Review only files with uncommitted git changes,
-                            included in full rather than truncated
+                            up to 3000 lines each
 ```
 
 ## Project Structure
@@ -115,7 +115,7 @@ adversarial-review/
 ├── lib/
 │   ├── date_utils.sh        # Cross-platform date utilities
 │   ├── circuit_breaker.sh   # Prevents runaway loops
-│   ├── transient.sh         # Decides whether a chunk was really reviewed
+│   ├── transient.sh         # Decides whether a chunk was really reviewed; defines the status block
 │   └── response_analyzer.sh # Unused: sourced, but nothing calls it (the main script has its own parser)
 ├── chunks/                  # Manifests and file lists for chunked reviews
 ├── prompts/
@@ -162,6 +162,9 @@ VERBOSE=1             # Enable verbose output
 DRY_RUN=1            # Show what would happen
 NO_FIX=0             # Same as --fix
 CODEX_BIN=codex.cmd  # Use this codex binary as given
+READ_ONLY_TOOLS=Read,Grep,Glob          # Tools for every non-fix Claude call
+FIX_MODE_TOOLS=Read,Grep,Glob,Edit,Write  # Tools for the fix-mode synthesis
+MAX_SOURCE_LINES=500  # Per-file line cap (also MAX_SOURCE_FILES, MAX_SOURCE_SHELL_*)
 ```
 
 ## How It Works
@@ -186,7 +189,7 @@ SUMMARY: Found critical type mixing bug
 ### Exit Conditions
 
 The loop exits when:
-1. **Both agents report NO_ISSUES** in Phase 1
+1. **Both agents report no issues** in Phase 1 (exit signal and zero issues)
 2. **Synthesis completes** with EXIT_SIGNAL: true
 3. **Max iterations reached**
 4. **Circuit breaker opens** (stagnation detected)

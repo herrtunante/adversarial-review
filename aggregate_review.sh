@@ -17,10 +17,15 @@ OUT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -o|--out) OUT="$2"; shift 2 ;;
+        -o|--out)
+            # A flag given last has no $2, which `set -u` reported as an unbound variable.
+            [[ $# -ge 2 && -n "$2" ]] || { echo "$1 needs a value" >&2; exit 1; }
+            OUT="$2"; shift 2 ;;
         -h|--help)
             sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
+        # A mistyped option used to be taken as the run directory.
+        -*) echo "unknown option: $1" >&2; echo "usage: $0 <run_dir> [-o out.md]" >&2; exit 1 ;;
         *) RUN_DIR="$1"; shift ;;
     esac
 done
@@ -32,7 +37,8 @@ SUMMARY_JSON="$RUN_DIR/summary.json"
 
 command -v jq > /dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 
-# chunk_is_reviewed, latest_iter_artifact and artifact_has_block. The driver, the
+# chunk_is_reviewed, latest_iter_artifact, artifact_has_block, extract_status_block
+# and strip_status_block. The driver, the
 # supervisor and the file-list runner decide "is this chunk done?" with
 # chunk_is_reviewed; the report used its own weaker test and could tabulate a
 # chunk they had counted as failed.
@@ -49,16 +55,24 @@ jq_raw() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' jq "$@" | tr -d '\r'; }
 
 # Pull one KEY from a status block in an artifact. The block delimiters vary per
 # phase, so the caller passes the block name.
+#
+# The block is the one extract_status_block returns - the LAST complete block in
+# the file, the same one parse_status_block in adversarial_review.sh reads. This
+# used to take the first: a report that quotes an example block ahead of its own
+# was tabulated with the example's counters. A line is read the way the parser
+# reads it: the key is what precedes the first colon, blanks removed and case
+# ignored; the value is the rest, trimmed; the last line for a key wins. Prints
+# an empty line, and still returns 0, when there is no block or no such key:
+# both are normal here, and under `set -e` a failing command substitution in a
+# bare assignment kills the script.
 status_value() {
-    local file="$1" block="$2" key="$3"
-    [[ -f "$file" ]] || { echo ""; return; }
-    # `|| true`: grep exits 1 when the key is absent, and under `set -e` a bare
-    # assignment from a failing command substitution kills the script. A missing
-    # key is normal here - an agent that crashed writes no status block at all.
-    sed -n "/---${block}---/,/---END_${block}---/p" "$file" 2>/dev/null \
-      | grep -m1 -E "^[[:space:]]*${key}:" \
-      | sed -E "s/^[[:space:]]*${key}:[[:space:]]*//" \
-      | tr -d '\r' || true
+    local file="$1" block="$2" key="$3" body
+    body="$(extract_status_block "$file" "$block")" || { echo ""; return 0; }
+    awk -v key="$key" '
+        { i = index($0, ":"); if (!i) next
+          k = substr($0, 1, i - 1); gsub(/[ \t\r]/, "", k)
+          if (toupper(k) == toupper(key)) v = substr($0, i + 1) }
+        END { gsub(/^[ \t\r]+|[ \t\r]+$/, "", v); print v }' <<< "$body" || true
 }
 
 num() { local v="${1:-}"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
@@ -85,14 +99,12 @@ find_synthesis() {
 # Strip the status block out of a report body so the merged document reads as
 # prose; the counters are already tabulated above it.
 strip_status() {
-    # sed's range runs to end of file when the closing delimiter is missing,
-    # which would delete the rest of the report. Leave an unterminated block
-    # where it is.
-    if artifact_has_block "$1" SYNTHESIS_STATUS; then
-        sed '/---SYNTHESIS_STATUS---/,/---END_SYNTHESIS_STATUS---/d' "$1"
-    else
-        cat "$1"
-    fi
+    # Only the block the counters were read from is removed. The sed range used
+    # here before started at the first mention of the delimiter, so it also took
+    # an example block quoted earlier in the report and, when the text after the
+    # real block named the opening delimiter again, everything from there to the
+    # end of the file. A file with no valid block comes back unchanged.
+    strip_status_block "$1" SYNTHESIS_STATUS || cat "$1"
 }
 
 chunk_dirs=()
@@ -103,8 +115,6 @@ while IFS= read -r d; do
     [[ -f "$d/exclude.regex" || -f "$d/files.list" ]] || continue
     chunk_dirs+=("$d")
 done < <(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
-
-[[ ${#chunk_dirs[@]} -gt 0 ]] || { echo "no chunk directories under $RUN_DIR" >&2; exit 1; }
 
 # Chunks the driver gave up on have no directory: it deletes a chunk whose
 # agents were refused and records only an index.tsv row. Without them "N chunks,
@@ -122,6 +132,12 @@ if [[ -f "$RUN_DIR/index.tsv" ]]; then
 fi
 total_chunks=$(( ${#chunk_dirs[@]} + ${#abandoned[@]} ))
 
+# Checked only now: when every chunk was abandoned and its directory deleted,
+# the index rows are all that is left, and that run is the one whose report is
+# most needed. From here on chunk_dirs may be empty, and bash before 4.4 treats
+# "${empty[@]}" as an unbound variable under `set -u`, hence the guarded loops.
+[[ $total_chunks -gt 0 ]] || { echo "no chunk directories or indexed chunks under $RUN_DIR" >&2; exit 1; }
+
 tot_high=0; tot_med=0; tot_skip=0; tot_claude=0; tot_codex=0
 tot_rej_claude=0; tot_rej_codex=0; tot_files=0
 done_count=0
@@ -134,7 +150,7 @@ json_chunks=""
 chunk_state=()
 chunk_synth=()
 
-for d in "${chunk_dirs[@]}"; do
+for d in ${chunk_dirs[@]+"${chunk_dirs[@]}"}; do
     cid="$(basename "$d")"
 
     # chunk_is_reviewed is the runners' own test: a chunk they would redo is
@@ -242,7 +258,7 @@ done
         echo "Not reviewed yet: ${pending[*]}."
         echo ""
     fi
-    for i in "${!chunk_dirs[@]}"; do
+    for (( i = 0; i < ${#chunk_dirs[@]}; i++ )); do
         d="${chunk_dirs[$i]}"
         cid="$(basename "$d")"
         [[ "${chunk_state[$i]}" != "pending" ]] || continue

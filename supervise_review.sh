@@ -37,20 +37,48 @@ CRASH_WAIT=300         # after any other unexpected exit
 MAX_RESTARTS=48        # 24h of 30-minute retries, then stop
 MAX_FINAL_PASSES=2     # re-runs once the driver reports completion with gaps
 
+usage_line() {
+    echo "usage: $0 --target DIR -o OUT_DIR [-t MIN] [--max-lines N] [--max-files N] [--only GLOB] MANIFEST"
+}
+
+# A flag that takes a value must be followed by one. Without the check a flag given last died with "unbound
+# variable", and one followed by another flag swallowed that flag as its value.
+need_arg() {
+    if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+        echo "[supervise] $1 needs a value" >&2
+        exit 1
+    fi
+}
+# No leading zero: bash arithmetic would read 08 as a bad octal number.
+need_int() {
+    if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[supervise] $1 must be a positive integer, got '$2'" >&2
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)     TARGET="$2"; shift 2 ;;
-        -o|--out)     OUT="$2"; shift 2 ;;
-        -t|--timeout) TIMEOUT_MIN="$2"; shift 2 ;;
+        --target)     need_arg "$@"; TARGET="$2"; shift 2 ;;
+        -o|--out)     need_arg "$@"; OUT="$2"; shift 2 ;;
+        -t|--timeout) need_arg "$@"; need_int "$1" "$2"; TIMEOUT_MIN="$2"; shift 2 ;;
         --max-lines|--max-files)
-                      EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-        --only)       ONLY_GLOB="$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+                      need_arg "$@"; need_int "$1" "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --only)       need_arg "$@"; ONLY_GLOB="$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        # Said out loud: taken as a positional, as it used to be, --fix silently gave a report-only run.
+        --fix)        echo "[supervise] --fix is not supported: the supervisor is report-only." >&2
+                      echo "[supervise] An unattended run that restarts itself must not write into the target; use run_chunked_review.sh --fix by hand." >&2
+                      exit 1 ;;
+        -h|--help)    usage_line; exit 0 ;;
+        # Only the options above are passed on to the driver. Anything else starting with '-' used to be taken
+        # for the manifest.
+        -*)           echo "[supervise] unknown option: $1" >&2; usage_line >&2; exit 1 ;;
         *)            MANIFEST="$1"; shift ;;
     esac
 done
 
 [[ -n "$TARGET" && -n "$OUT" && -n "$MANIFEST" ]] || {
-    echo "usage: $0 --target DIR -o OUT_DIR [-t MIN] [--max-lines N] [--max-files N] [--only GLOB] MANIFEST" >&2
+    usage_line >&2
     exit 1
 }
 
@@ -122,24 +150,28 @@ incomplete_chunks() {
     echo "$n"
 }
 
-# What did the most recent driver run say at the end? Only lines after the last
-# supervisor marker count, so an old run's ending is never mistaken for the
-# latest one's.
-last_run_tail() {
-    sed 's/\x1b\[[0-9;]*m//g' "$LOG" 2>/dev/null \
-      | awk '/^\[supervise\] .* starting driver/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }'
-}
-
 if driver_running; then
     say "a driver for $OUT is already running - waiting for it to exit"
     while driver_running; do sleep 60; done
     say "that driver has exited"
 fi
 
+# What to do next is decided from the exit code of the driver THIS supervisor last ran, and from nothing else.
+# It used to be read back from the end of driver.log, which is append-only: a supervisor started later acted on
+# the ending of an earlier session, and slept half an hour before its first driver or used up a final pass on a
+# run it had never made. driver_rc is empty until a driver has been run here, so the first one starts at once.
+#
+# Driver exit codes: 0 every chunk reviewed or empty, 1 bad arguments or manifest, 2 chunks failed, 3 the agent
+# CLI did not recover, 4 another run holds a lock in this checkout, 130/143 stopped by a signal.
+#
+# This script's own exit code: 0 only when every chunk the driver would run is reviewed or empty. When it gives
+# up: 1 the driver rejected its arguments or the manifest, 2 chunks still unreviewed after the extra passes, or
+# the driver kept exiting unexpectedly, 3 the agent CLI never came back.
 restarts=0
 final_passes=0
+driver_rc=""
+exit_code=0
 while :; do
-    tail_text="$(last_run_tail)"
     left=$(incomplete_chunks)
 
     if [[ "$left" -eq 0 ]]; then
@@ -147,36 +179,56 @@ while :; do
         break
     fi
 
-    if grep -q "did not recover" <<< "$tail_text"; then
-        restarts=$((restarts + 1))
-        if (( restarts > MAX_RESTARTS )); then
-            say "agent CLI still unavailable after $MAX_RESTARTS restarts - stopping; $left chunk(s) left"
+    case "$driver_rc" in
+        "") ;;
+        3)
+            restarts=$((restarts + 1))
+            if (( restarts > MAX_RESTARTS )); then
+                say "agent CLI still unavailable after $MAX_RESTARTS restarts - stopping; $left chunk(s) left"
+                exit_code=3
+                break
+            fi
+            say "agent CLI unavailable - retrying in $((RETRY_WAIT / 60)) min (restart $restarts/$MAX_RESTARTS, $left chunk(s) left)"
+            sleep "$RETRY_WAIT"
+            ;;
+        0|2)
+            final_passes=$((final_passes + 1))
+            if (( final_passes > MAX_FINAL_PASSES )); then
+                say "driver finished but $left chunk(s) still failed after $MAX_FINAL_PASSES extra passes - stopping"
+                exit_code=2
+                break
+            fi
+            say "driver finished with $left incomplete chunk(s) - running another pass ($final_passes/$MAX_FINAL_PASSES)"
+            ;;
+        1)
+            # Nothing a restart can change: the same arguments and manifest would be refused again.
+            say "driver rejected its arguments or the manifest (exit 1) - not retrying; $left chunk(s) left; check with the driver's --list"
+            exit_code=1
             break
-        fi
-        say "agent CLI unavailable - retrying in $((RETRY_WAIT / 60)) min (restart $restarts/$MAX_RESTARTS, $left chunk(s) left)"
-        sleep "$RETRY_WAIT"
-    elif grep -q "run complete" <<< "$tail_text"; then
-        final_passes=$((final_passes + 1))
-        if (( final_passes > MAX_FINAL_PASSES )); then
-            say "driver finished but $left chunk(s) still failed after $MAX_FINAL_PASSES extra passes - stopping"
-            break
-        fi
-        say "driver finished with $left incomplete chunk(s) - running another pass ($final_passes/$MAX_FINAL_PASSES)"
-    elif [[ -n "$tail_text" ]]; then
-        restarts=$((restarts + 1))
-        if (( restarts > MAX_RESTARTS )); then
-            say "driver keeps exiting unexpectedly - stopping; $left chunk(s) left"
-            break
-        fi
-        say "driver exited unexpectedly - restarting in $((CRASH_WAIT / 60)) min"
-        sleep "$CRASH_WAIT"
-    fi
+            ;;
+        *)
+            restarts=$((restarts + 1))
+            if (( restarts > MAX_RESTARTS )); then
+                say "driver keeps exiting unexpectedly - stopping; $left chunk(s) left"
+                exit_code=2
+                break
+            fi
+            if [[ "$driver_rc" == "4" ]]; then
+                say "another run holds a lock in this checkout (driver exit 4) - retrying in $((CRASH_WAIT / 60)) min (restart $restarts/$MAX_RESTARTS)"
+            else
+                say "driver exited unexpectedly (code $driver_rc) - restarting in $((CRASH_WAIT / 60)) min (restart $restarts/$MAX_RESTARTS)"
+            fi
+            sleep "$CRASH_WAIT"
+            ;;
+    esac
 
     # Never start a second driver on the same output: that is how two runs once
     # interleaved and produced a report built from the wrong package.
     if driver_running; then
         say "another driver appeared for $OUT - waiting for it instead of starting one"
         while driver_running; do sleep 60; done
+        # That driver was not ours and its exit code is unknown: look at what is left and start afresh.
+        driver_rc=""
         continue
     fi
 
@@ -193,5 +245,7 @@ while :; do
     # ${a[@]+"${a[@]}"}: under set -u, bash before 4.4 (Git Bash ships 4.3) treats an empty array as unset and
     # aborts the script here when none of the pass-through options was given.
     "$DRIVER" --target "$TARGET" -t "$TIMEOUT_MIN" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} --resume -o "$OUT" "$MANIFEST" >> "$LOG" 2>&1
-    say "driver exited with code $?"
+    driver_rc=$?
+    say "driver exited with code $driver_rc"
 done
+exit "$exit_code"

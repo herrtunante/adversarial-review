@@ -23,9 +23,9 @@
 # Simpler than the chunk driver: it retries a refused agent a few times but does
 # not wait out a long quota reset, and it does not salvage a finished debate.
 #
-# Exit codes: 0 every chunk reviewed, 1 bad arguments or a chunk without a
-# complete review, 4 another driver or wrapper is working in this checkout,
-# 130/143 stopped by INT/TERM.
+# Exit codes: 0 every chunk reviewed and the report built, 1 bad arguments, a
+# chunk without a complete review, or the aggregate failed, 4 another driver,
+# wrapper or review is working in this checkout, 130/143 stopped by INT/TERM.
 
 set -uo pipefail
 
@@ -45,18 +45,44 @@ usage() {
     exit "${1:-1}"
 }
 
+# A flag that takes a value must be followed by one. Without the check a flag given last died with "unbound
+# variable", and one followed by another flag swallowed that flag as its value.
+need_arg() {
+    if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+        echo "$1 needs a value" >&2
+        exit 1
+    fi
+}
+# No leading zero: bash arithmetic would read 08 as a bad octal number.
+need_int() {
+    if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$1 must be a positive integer, got '$2'" >&2
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)      TARGET="$2"; shift 2 ;;
-        -o|--out)      OUT="$2"; shift 2 ;;
-        -t|--timeout)  TIMEOUT_MIN="$2"; shift 2 ;;
-        --max-lines)   SRC_LINES="$2"; shift 2 ;;
-        --attempts)    MAX_ATTEMPTS="$2"; shift 2 ;;
-        --retry-wait)  RETRY_WAIT="$2"; shift 2 ;;
+        --target)      need_arg "$@"; TARGET="$2"; shift 2 ;;
+        -o|--out)      need_arg "$@"; OUT="$2"; shift 2 ;;
+        -t|--timeout)  need_arg "$@"; need_int "$1" "$2"; TIMEOUT_MIN="$2"; shift 2 ;;
+        --max-lines)   need_arg "$@"; need_int "$1" "$2"; SRC_LINES="$2"; shift 2 ;;
+        --attempts)    need_arg "$@"; need_int "$1" "$2"; MAX_ATTEMPTS="$2"; shift 2 ;;
+        --retry-wait)  need_arg "$@"; need_int "$1" "$2"; RETRY_WAIT="$2"; shift 2 ;;
         -h|--help)     usage 0 ;;
+        # Without this arm an unknown or misspelt option was taken for a file list.
+        -*)            echo "unknown option: $1" >&2; exit 1 ;;
         *)             LISTS+=("$1"); shift ;;
     esac
 done
+
+# A chunk's scope is its file list and nothing else. The review reads all of these from the environment, so a
+# value exported in the caller's shell would be inherited by every chunk: CHANGED_ONLY is tested before the file
+# list in the collector and would replace the list with the target's uncommitted files, still archived as a
+# complete review. SOURCE_FILE_LIST and MAX_SOURCE_LINES are set on every review started below, report-only is
+# passed as --no-fix, and with a file list the collector uses none of the other caps or the exclude regex.
+unset CHANGED_ONLY FROM_PHASE NO_FIX SOURCE_FILE_LIST
+unset MAX_SOURCE_FILES MAX_SOURCE_LINES MAX_SOURCE_SHELL_FILES MAX_SOURCE_SHELL_LINES MAX_SOURCE_EXCLUDE
 
 [[ -n "$TARGET" && -n "$OUT" && ${#LISTS[@]} -gt 0 ]] || usage
 [[ -d "$TARGET" ]] || { echo "no target directory: $TARGET" >&2; exit 1; }
@@ -193,10 +219,12 @@ for list in "${ABS_LISTS[@]}"; do
         # Never clear artifacts/ under a live review; see reset_all in adversarial_review.sh.
         if [[ -f .review.lock ]] && kill -0 "$(cat .review.lock 2>/dev/null)" 2>/dev/null; then
             log "another review holds .review.lock; aborting"
-            exit 1
+            exit 4
         fi
         # scope.stamp belongs to the artifacts it was written with: left behind, it would vouch for the next chunk's.
-        rm -f artifacts/iter*.md artifacts/scope.stamp logs/iter*.log 2>/dev/null || true
+        # tracking.json goes too: a review that exits before it writes one would otherwise be archived with the
+        # previous chunk's status.
+        rm -f artifacts/iter*.md artifacts/scope.stamp logs/iter* tracking.json 2>/dev/null || true
         "$REVIEW_SH" --reset-circuit > /dev/null 2>&1 || true
 
         log "$chunk: attempt $attempt of $MAX_ATTEMPTS"
@@ -237,10 +265,13 @@ for list in "${ABS_LISTS[@]}"; do
     [[ $done_ok -eq 1 ]] || failed=$((failed + 1))
 done
 
+# A run whose report could not be built has not finished, even with every chunk reviewed.
+agg_ok=1
 if "$SCRIPT_DIR/aggregate_review.sh" "$OUT" > "$OUT/aggregate.log" 2>&1; then
     log "report: $OUT/REPORT.md"
 else
+    agg_ok=0
     log "aggregate failed, see $OUT/aggregate.log"
 fi
 log "finished ($failed chunk(s) without a complete review)"
-[[ $failed -eq 0 ]]
+[[ $failed -eq 0 && $agg_ok -eq 1 ]]

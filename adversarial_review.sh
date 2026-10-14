@@ -4,7 +4,7 @@
 #
 # Implements an adversarial review loop where Claude and GPT Codex
 # independently review code, cross-review findings, meta-review feedback,
-# and then Claude synthesizes and implements fixes.
+# and then Claude synthesizes a report (and, with --fix, implements the fixes).
 #
 # Based on patterns from asimov-ralph (https://github.com/frankbria/ralph-claude-code)
 #
@@ -41,8 +41,10 @@ TRACKING_FILE="$AR_DIR/tracking.json"
 source "$LIB_DIR/date_utils.sh"
 source "$LIB_DIR/circuit_breaker.sh"
 source "$LIB_DIR/response_analyzer.sh"
-# Only for artifact_is_failure_note (verify_resume_artifacts). It defines
-# functions and patterns and runs nothing.
+# Shared with the chunk drivers and the aggregator so there is one definition of
+# each: extract_status_block / artifact_has_block (what a complete status block
+# is) and artifact_is_failure_note / artifact_is_failed_call (what a failed agent
+# call looks like). It defines functions and patterns and runs nothing.
 source "$LIB_DIR/transient.sh"
 
 # Defaults
@@ -60,6 +62,19 @@ NO_FIX="${NO_FIX:-1}"
 # --dangerously-skip-permissions, which handed the same prompt every tool. It is
 # a tool allowlist, not filesystem containment.
 FIX_MODE_TOOLS="${FIX_MODE_TOOLS:-Read,Grep,Glob,Edit,Write}"
+# The tools every other Claude call gets (phases 1-3 and a report-only phase 4).
+# Those calls run inside the target too; without a tool list of their own they
+# ran with whatever the user's settings allowed, shell included.
+READ_ONLY_TOOLS="${READ_ONLY_TOOLS:-Read,Grep,Glob}"
+# Passed to every Claude call so the TARGET's configuration is not loaded: the
+# reviewed project's .claude/settings*.json (hooks, permissions) and its
+# .mcp.json would otherwise act on a call whose cwd is that project. Both flags
+# are documented by `claude --help` (2.1.296):
+#   --setting-sources <sources>  Comma-separated list of setting sources to load
+#                                (user, project, local).
+#   --strict-mcp-config          Only use MCP servers from --mcp-config, ignoring
+#                                all other MCP configurations
+CLAUDE_ISOLATION_ARGS=(--setting-sources user --strict-mcp-config)
 # Start the first iteration at this phase instead of phase 1, reusing the
 # artifacts already in artifacts/. Only phase 4 is expensive to lose, so this
 # exists to recover a run whose debate succeeded and whose synthesis was refused.
@@ -114,6 +129,26 @@ get_timeout_cmd() {
         echo "timeout"   # Linux
     else
         echo ""
+    fi
+}
+
+# Set TIMEOUT_WORDS to the words to put in front of an agent command so it is
+# stopped after $1 seconds; empty when there is no timeout command. -k 30s sends
+# KILL half a minute after the TERM: a CLI that ignores TERM used to hold its
+# phase for ever. A timeout without -k (busybox, very old coreutils) is probed
+# for and gets the plain form. A global rather than output to capture: each
+# caller is already its own background subshell.
+TIMEOUT_WORDS=()
+set_timeout_words() {
+    local secs="$1"
+    local cmd
+    cmd=$(get_timeout_cmd)
+    TIMEOUT_WORDS=()
+    [[ -n "$cmd" ]] || return 0
+    if "$cmd" -k 1s 5s true > /dev/null 2>&1; then
+        TIMEOUT_WORDS=("$cmd" -k 30s "${secs}s")
+    else
+        TIMEOUT_WORDS=("$cmd" "${secs}s")
     fi
 }
 
@@ -226,7 +261,9 @@ update_tracking() {
     ' "$TRACKING_FILE" > "$tmp" && mv "$tmp" "$TRACKING_FILE"
 }
 
-# Add to history
+# Add to history. The result is a parse_status_block object and is stored as
+# one, not as a string of JSON, so --status can read its fields; anything that
+# is not JSON is kept as the string it is.
 add_to_history() {
     local iteration="$1"
     local phase="$2"
@@ -239,28 +276,17 @@ add_to_history() {
             "iteration": ($i | tonumber),
             "phase": $p,
             "agent": $a,
-            "result": $r,
+            "result": ($r | fromjson? // $r),
             "timestamp": $ts
         }]
     ' "$TRACKING_FILE" > "$tmp" && mv "$tmp" "$TRACKING_FILE"
 }
 
-# Print the body of the LAST complete ---NAME--- ... ---END_NAME--- block in a
-# file, without the delimiter lines. Returns 1 when the file has no complete
-# block. The last one is the agent's real status: earlier ones can be examples
-# quoted in the prose, and merging them (the old sed range did) let an example
-# override the answer. A block that is opened and never closed does not count.
-extract_status_block() {
-    local file="$1"
-    local block_name="$2"
-
-    [[ -f "$file" ]] || return 1
-    tr -d '\r' < "$file" | awk -v s="---${block_name}---" -v e="---END_${block_name}---" '
-        index($0, e)        { if (inb) { last = buf; found = 1 }; inb = 0; next }
-        index($0, s)        { buf = ""; inb = 1; next }
-        inb                 { buf = buf $0 "\n" }
-        END                 { if (!found) exit 1; printf "%s", last }'
-}
+# extract_status_block FILE BLOCK_NAME comes from lib/transient.sh: it prints the
+# lines of the LAST complete block without its two delimiter lines, and fails
+# (printing nothing) when there is no complete block or when a block opened
+# after the last complete one was never closed. There is deliberately no second
+# definition here; the aggregator reads the same blocks through the same one.
 
 # Parse status block from agent output
 # Format: ---REVIEW_STATUS--- ... ---END_REVIEW_STATUS---
@@ -280,8 +306,10 @@ parse_status_block() {
 
     local block
     if ! block=$(extract_status_block "$file" "$block_name"); then
-        # No status block found, try to detect NO_ISSUES
-        if grep -qE '^[[:space:]]*NO_ISSUES[[:space:]]*$' "$file"; then
+        # No status block found, try to detect NO_ISSUES. Never in a failure
+        # note: the lines it quotes from the CLI's output can hold that word,
+        # and a failed call would then parse as a clean review.
+        if ! artifact_is_failure_note "$file" && grep -qE '^[[:space:]]*NO_ISSUES[[:space:]]*$' "$file"; then
             echo '{"exit_signal": true, "issues_found": 0}'
             return 0
         fi
@@ -318,6 +346,23 @@ parse_status_block() {
     echo "$json"
 }
 
+# status_count JSON KEY [DEFAULT] - a counter out of a parse_status_block
+# object. Everything in a status block is agent text, and [[ -gt ]], (( )) and
+# $(( )) evaluate their operands as arithmetic: a value such as a[$(cmd)] RUNS
+# cmd in this script, outside the tool list the agent was given. So every
+# counter is read through here and nowhere else. Prints the value when it is a
+# plain decimal of at most 9 digits, DEFAULT (0 when not given) for anything
+# else - missing, negative, text, a boolean. Always returns 0.
+status_count() {
+    local v
+    v=$(printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // empty | tostring' 2>/dev/null | tr -d '\r') || v=""
+    if [[ "$v" =~ ^[0-9]{1,9}$ ]]; then
+        echo "$((10#$v))"
+    else
+        echo "${3:-0}"
+    fi
+}
+
 # Emit one file of the source dump, and say so when it was cut at the line cap.
 # Without the notice an agent reports the cut as an unclosed block, or approves
 # logic whose second half it never saw. The "=== FILE: " marker format is read
@@ -342,9 +387,9 @@ dump_file() {
 # `git status --porcelain` emits paths relative to the REPOSITORY ROOT, which is
 # not necessarily the target directory - a target can sit several levels below
 # its repo root. Resolve every path against the root, then keep only the files
-# that actually live under the target. Files are included whole rather than
-# head-truncated: a changed set is small, and truncating a diff under review
-# defeats the point.
+# that actually live under the target. Files are included up to 3000 lines each
+# (not MAX_SOURCE_LINES): a changed set is small, and cutting a diff under
+# review at 500 lines defeats the point. dump_file marks a file that was cut.
 collect_changed_files() {
     local target_dir="$1"
     local max_lines="${2:-3000}"
@@ -523,28 +568,26 @@ run_claude() {
 
     log_claude "Running..."
 
-    local timeout_cmd=$(get_timeout_cmd)
-    local timeout_secs=$((TIMEOUT_MINUTES * 60))
+    set_timeout_words $((TIMEOUT_MINUTES * 60))
 
-    # Fix mode: the agent may read and edit files, and that is all. --tools
-    # removes every other built-in tool (no Bash at all, whatever the user's
-    # settings allow) and --allowedTools pre-approves the remaining ones, which
-    # --print needs because nobody is there to answer a permission prompt.
-    # Without either flag (every other call) a write is simply denied.
-    local cmd_args=(--print)
-    [[ "$with_permissions" == "true" ]] && cmd_args+=(--tools "$FIX_MODE_TOOLS" --allowedTools "$FIX_MODE_TOOLS")
+    # Every call names its tools. Fix mode may read and edit files; every other
+    # call may only read. --tools removes all other built-in tools (no Bash at
+    # all, whatever the user's settings allow) and --allowedTools pre-approves
+    # the ones that are left, which --print needs because nobody is there to
+    # answer a permission prompt. CLAUDE_ISOLATION_ARGS keeps the target's own
+    # settings, hooks and MCP servers out of the call.
+    local tools="$READ_ONLY_TOOLS"
+    [[ "$with_permissions" == "true" ]] && tools="$FIX_MODE_TOOLS"
+    local cmd_args=(--print --tools "$tools" --allowedTools "$tools" "${CLAUDE_ISOLATION_ARGS[@]}")
 
     # stderr goes to a log, not into the artifact: CLI warnings used to become
     # review text and were handed to the next phase as if the agent had said them.
     local claude_log="$LOGS_DIR/$(basename "${output_file%.md}").claude.log"
     mkdir -p "$LOGS_DIR"
 
+    # ${a[@]+"${a[@]}"}: an empty array is "unbound" under set -u before bash 4.4.
     local exit_code=0
-    if [[ -n "$timeout_cmd" ]]; then
-        (cd "$working_dir" && echo "$prompt" | $timeout_cmd ${timeout_secs}s claude "${cmd_args[@]}") > "$output_file" 2> "$claude_log" || exit_code=$?
-    else
-        (cd "$working_dir" && echo "$prompt" | claude "${cmd_args[@]}") > "$output_file" 2> "$claude_log" || exit_code=$?
-    fi
+    (cd "$working_dir" && echo "$prompt" | ${TIMEOUT_WORDS[@]+"${TIMEOUT_WORDS[@]}"} claude "${cmd_args[@]}") > "$output_file" 2> "$claude_log" || exit_code=$?
 
     # A failed or silent call must stay recognisable now that stderr is no
     # longer in the artifact, wherever the CLI printed its refusal. Same shape
@@ -575,10 +618,8 @@ run_claude() {
 
     if [[ $exit_code -eq 0 ]]; then
         log_claude "Complete ($(wc -l < "$output_file" | tr -d ' ') lines)"
-    elif [[ $exit_code -eq 124 ]]; then
-        log_warning "Claude timed out after ${TIMEOUT_MINUTES}m"
     else
-        log_warning "Claude exited with code $exit_code"
+        log_warning "Claude: $(describe_exit $exit_code)"
     fi
 
     return $exit_code
@@ -603,8 +644,7 @@ run_codex() {
     # artifact satisfies, and it would then be parsed as this run's review.
     rm -f "$output_file"
 
-    local timeout_cmd=$(get_timeout_cmd)
-    local timeout_secs=$((TIMEOUT_MINUTES * 60))
+    set_timeout_words $((TIMEOUT_MINUTES * 60))
 
     # codex >= 0.30 uses the `exec` subcommand; the old `-q --full-auto --prompt` form is gone.
     # The prompt is piped on stdin rather than passed as an argument: the phase-1 source dump
@@ -613,8 +653,8 @@ run_codex() {
     #
     # -o/--output-last-message is load-bearing, not a nicety: `codex exec` echoes the whole
     # prompt plus a banner to stdout, and our prompts contain EXAMPLE status blocks. Capturing
-    # stdout would feed those examples to parse_status_block's sed range match and corrupt the
-    # parsed result. -o writes only the agent's final message.
+    # stdout would feed those examples to parse_status_block, which would take one as the
+    # agent's status. -o writes only the agent's final message.
     local codex_bin="${CODEX_BIN:-codex}"
     local codex_log="$LOGS_DIR/$(basename "${output_file%.md}").codex.log"
 
@@ -635,18 +675,24 @@ run_codex() {
     mkdir -p "$LOGS_DIR"
 
     local exit_code=0
-    if [[ -n "$timeout_cmd" ]]; then
-        (cd "$working_dir" && printf '%s' "$prompt" | $timeout_cmd ${timeout_secs}s "$codex_bin" "${codex_args[@]}") > "$codex_log" 2>&1 || exit_code=$?
-    else
-        (cd "$working_dir" && printf '%s' "$prompt" | "$codex_bin" "${codex_args[@]}") > "$codex_log" 2>&1 || exit_code=$?
-    fi
+    (cd "$working_dir" && printf '%s' "$prompt" | ${TIMEOUT_WORDS[@]+"${TIMEOUT_WORDS[@]}"} "$codex_bin" "${codex_args[@]}") > "$codex_log" 2>&1 || exit_code=$?
 
-    if [[ -s "$codex_tmp" ]]; then
+    # The final-message file is the review only when codex also exited 0. A
+    # call that failed part-way can leave a partial answer there; taken as the
+    # review it made a dead agent a full participant in the debate. It is kept
+    # in the transcript for diagnosis and the failure note below is written.
+    if [[ $exit_code -eq 0 && -s "$codex_tmp" ]]; then
         mv "$codex_tmp" "$output_file"
+    elif [[ -s "$codex_tmp" ]]; then
+        {
+            echo
+            echo "--- final message of the failed call (exit code $exit_code) ---"
+            cat "$codex_tmp"
+        } >> "$codex_log"
     fi
     rm -f "$codex_tmp"
 
-    # Codex died before writing the final message. Record a short, explicit note rather than copying the transcript:
+    # Codex died before writing the final message, or exited non-zero. Record a short, explicit note rather than copying the transcript:
     # the transcript is the prompt echoed back plus the agent's reasoning, so as an artifact it would feed the next
     # phase 100-200 KB of noise and hand parse_status_block the EXAMPLE status block out of the prompt template -
     # which reads as "0 issues found" and is indistinguishable from a clean review. A quota refusal used to be
@@ -668,10 +714,8 @@ run_codex() {
 
     if [[ $exit_code -eq 0 ]]; then
         log_codex "Complete ($(wc -l < "$output_file" | tr -d ' ') lines)"
-    elif [[ $exit_code -eq 124 ]]; then
-        log_warning "Codex timed out after ${TIMEOUT_MINUTES}m"
     else
-        log_warning "Codex exited with code $exit_code"
+        log_warning "Codex: $(describe_exit $exit_code)"
     fi
 
     return $exit_code
@@ -693,9 +737,13 @@ sha256_hash() {
     fi
 }
 
+# 124 is timeout's own code. 137 (128 + KILL) is what it returns when the agent
+# ignored TERM and -k had to kill it; a kill -9 from outside looks the same.
 describe_exit() {
     if [[ "$1" -eq 124 ]]; then
         echo "timed out after ${TIMEOUT_MINUTES}m"
+    elif [[ "$1" -eq 137 ]]; then
+        echo "killed (exit code 137): timed out after ${TIMEOUT_MINUTES}m and ignored TERM, or was killed from outside"
     else
         echo "exit code $1"
     fi
@@ -705,8 +753,9 @@ describe_exit() {
 # Exit codes used to be discarded with `wait || true`, which made a crashed or
 # timed-out agent indistinguishable from a clean review: the artifact has no
 # status block, so it parses to 0 issues and the loop burns iterations on
-# garbage. Returns non-zero only when BOTH agents failed, which is unrecoverable
-# for the iteration; a single failure degrades to a warning.
+# garbage. Returns non-zero only when BOTH agents failed. A single failure is
+# logged here and stops the run one step later: run_review_loop checks the
+# artifacts with iteration_has_failed_call after each of phases 1 to 3.
 wait_for_agents() {
     local claude_pid="$1"
     local codex_pid="$2"
@@ -729,6 +778,24 @@ wait_for_agents() {
         return 1
     fi
     return 0
+}
+
+# A debate needs both agents. One failed call used to degrade to a warning, and
+# its failure note was then handed to the other agent as "the review to
+# analyse": the run ended report_only, exit 0, with one voice in it. True when
+# any phase 1-3 artifact of iteration $1 is a failed call (an empty file, an
+# agent's failure note, or a quota/network refusal - lib/transient.sh). A
+# dry-run stub is none of those.
+iteration_has_failed_call() {
+    local f
+    for f in "$ARTIFACTS_DIR"/iter"$1"_[123]_*.md; do
+        [[ -f "$f" ]] || continue
+        if artifact_is_failed_call "$f"; then
+            log_error "Failed agent call: $f"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Fingerprint the ISSUES in a set of reviews, not their prose.
@@ -874,14 +941,22 @@ $source_code
     add_to_history "$iteration" "phase_1" "claude" "$claude_status"
     add_to_history "$iteration" "phase_1" "codex" "$codex_status"
 
-    # Check for dual NO_ISSUES
-    if [[ "$claude_exit" == "true" ]] && [[ "$codex_exit" == "true" ]]; then
+    # "unknown" when the count is missing or not a number; only compared as a
+    # string below, never as a number.
+    local claude_issues codex_issues
+    claude_issues=$(status_count "$claude_status" issues_found unknown)
+    codex_issues=$(status_count "$codex_status" issues_found unknown)
+
+    # Clean means both say so AND both count zero issues. EXIT_SIGNAL alone
+    # used to end the run as clean with "ISSUES_FOUND: 3" in both blocks.
+    if [[ "$claude_exit" == "true" && "$codex_exit" == "true" \
+          && "$claude_issues" == "0" && "$codex_issues" == "0" ]]; then
         log_success "Both agents report NO_ISSUES"
         return 0  # Signal clean exit
     fi
-
-    local claude_issues=$(echo "$claude_status" | jq -r '.issues_found // 0')
-    local codex_issues=$(echo "$codex_status" | jq -r '.issues_found // 0')
+    if [[ "$claude_exit" == "true" && "$codex_exit" == "true" ]]; then
+        log_warning "Both agents set EXIT_SIGNAL but do not both report zero issues - continuing the debate"
+    fi
 
     log_info "Claude found: $claude_issues issues"
     log_info "Codex found: $codex_issues issues"
@@ -1135,8 +1210,8 @@ Working directory: $target_dir
     # ground truth rather than the agent's self-report.
     local state_before=$(target_state_hash "$target_dir")
 
-    # Report-only mode also withholds the edit tools (see run_claude), so the
-    # prompt override is backed by an actual permission boundary.
+    # Report-only mode gets READ_ONLY_TOOLS instead of FIX_MODE_TOOLS (see
+    # run_claude), so the prompt override is backed by an actual tool boundary.
     local allow_writes="true"
     [[ "$NO_FIX" == "1" ]] && allow_writes="false"
 
@@ -1161,7 +1236,8 @@ Working directory: $target_dir
 
     local status=$(parse_status_block "$output_file" "SYNTHESIS_STATUS")
     local exit_signal=$(echo "$status" | jq -r '.exit_signal // false')
-    local reported_modified=$(echo "$status" | jq -r '.files_modified // 0')
+    local reported_modified
+    reported_modified=$(status_count "$status" files_modified)
 
     # Progress = did the target's working tree actually change. FILES_MODIFIED is
     # self-reported by the agent, and a missing status block parses to 0, which
@@ -1184,9 +1260,6 @@ Working directory: $target_dir
 
     add_to_history "$iteration" "phase_4" "claude" "$status"
 
-    # Report-only mode stops here. Nothing was changed, so a further iteration
-    # would re-review byte-identical code, and feeding a guaranteed zero-progress
-    # result to the circuit breaker would leave it dirty for the next real run.
     if [[ "$NO_FIX" == "1" ]]; then
         if [[ "$state_before" == "no-git" ]]; then
             # Two identical "no-git" sentinels prove nothing about the files.
@@ -1196,20 +1269,30 @@ Working directory: $target_dir
         else
             log_success "Report-only: target untouched"
         fi
-        # The report is this mode's whole product. A synthesis that timed out,
-        # was refused, or stopped before its status block is not a report, and
-        # must not end the run as "Report complete". A dry run is exempt: its
-        # stub artifact has no status block by design.
-        if [[ "$DRY_RUN" != "1" ]]; then
-            if [[ $synth_rc -ne 0 ]]; then
-                log_error "Synthesis produced no usable report: $output_file"
-                return 2
-            fi
-            if ! extract_status_block "$output_file" "SYNTHESIS_STATUS" > /dev/null; then
-                log_error "Synthesis report has no complete SYNTHESIS_STATUS block - not a usable report: $output_file"
-                return 2
-            fi
+    fi
+
+    # A synthesis that timed out, was refused, or stopped before its status
+    # block is not a result in either mode. It must not end a report-only run
+    # as "Report complete", and in fix mode it must not be fed to the circuit
+    # breaker as an iteration and followed by another seven-call debate on a
+    # target that may be half edited (this check used to sit inside the
+    # report-only branch). A dry run is exempt: its stub has no status block by
+    # design.
+    if [[ "$DRY_RUN" != "1" ]]; then
+        if [[ $synth_rc -ne 0 ]] || artifact_is_failure_note "$output_file"; then
+            log_error "Synthesis produced no usable result: $output_file"
+            return 2
         fi
+        if ! artifact_has_block "$output_file" "SYNTHESIS_STATUS"; then
+            log_error "Synthesis has no complete SYNTHESIS_STATUS block - not a usable result: $output_file"
+            return 2
+        fi
+    fi
+
+    # Report-only mode stops here. Nothing was changed, so a further iteration
+    # would re-review byte-identical code, and feeding a guaranteed zero-progress
+    # result to the circuit breaker would leave it dirty for the next real run.
+    if [[ "$NO_FIX" == "1" ]]; then
         log_success "Report written to $output_file"
         return 0
     fi
@@ -1224,10 +1307,11 @@ Working directory: $target_dir
 
     # Surface arbiter bias: Claude is both a debater and the judge here, so make
     # any lopsided accept/reject split visible instead of silent.
-    local from_claude=$(echo "$status" | jq -r '.fixes_from_claude // 0')
-    local from_codex=$(echo "$status" | jq -r '.fixes_from_codex // 0')
-    local rej_claude=$(echo "$status" | jq -r '.rejected_from_claude // 0')
-    local rej_codex=$(echo "$status" | jq -r '.rejected_from_codex // 0')
+    local from_claude from_codex rej_claude rej_codex
+    from_claude=$(status_count "$status" fixes_from_claude)
+    from_codex=$(status_count "$status" fixes_from_codex)
+    rej_claude=$(status_count "$status" rejected_from_claude)
+    rej_codex=$(status_count "$status" rejected_from_codex)
     log_info "Arbiter split - accepted: Claude=$from_claude Codex=$from_codex | rejected: Claude=$rej_claude Codex=$rej_codex"
     if [[ "$rej_codex" -gt 0 && "$rej_codex" -gt $((rej_claude * 2 + 1)) ]]; then
         log_warning "Synthesis rejected disproportionately many Codex findings - possible self-preference bias"
@@ -1472,11 +1556,29 @@ verify_resume_artifacts() {
     local missing=()
     local required=()
 
+    # Only a single-iteration debate can be resumed. scope.stamp is rewritten
+    # by every iteration's phase 1, so with iter2_* files present it describes
+    # the source AFTER iteration 1's fixes while the iter1_* files resumed below
+    # were written about the source before them. The pattern is a glob, so
+    # iter10_ is not taken for iter1_.
+    local f
+    for f in "$ARTIFACTS_DIR"/iter*_*.md; do
+        [[ -f "$f" ]] || continue
+        case "${f##*/}" in
+            iter1_*) ;;
+            *)
+                log_error "--from-phase $from: $ARTIFACTS_DIR holds artifacts of more than one iteration (${f##*/})"
+                log_error "scope.stamp describes the last iteration's source, the saved debate is"
+                log_error "iteration 1's. Run the review from phase 1."
+                return 1
+                ;;
+        esac
+    done
+
     [[ $from -ge 2 ]] && required+=("iter1_1_claude_review.md" "iter1_1_codex_review.md")
     [[ $from -ge 3 ]] && required+=("iter1_2_claude_on_codex.md" "iter1_2_codex_on_claude.md")
     [[ $from -ge 4 ]] && required+=("iter1_3_claude_meta.md" "iter1_3_codex_meta.md")
 
-    local f
     for f in "${required[@]}"; do
         # 200 bytes is well under any real review and well over a one-line
         # refusal such as "You have hit your session limit".
@@ -1539,6 +1641,18 @@ run_review_loop() {
     guard_existing_artifacts
     acquire_lock
     refuse_foreign_driver
+
+    # A run from phase 1 owns artifacts/ from here on. Files left by an earlier
+    # run used to stay: a phase-1 "clean" exit sat beside an older run's
+    # phase 2-4 files, and a run stopped after phase 1 left a fresh scope.stamp
+    # vouching for an older debate, which --from-phase 3 then accepted. Only
+    # after the lock is ours, never when resuming, and not in a dry run (which
+    # writes no logs, and whose guard above has already refused to run over
+    # real artifacts). The chunk drivers clear before calling; this is the same
+    # thing for a standalone run.
+    if [[ "$FROM_PHASE" -le 1 && "$DRY_RUN" != "1" ]]; then
+        rm -f "${ARTIFACTS_DIR:?}"/iter*.md "$SCOPE_STAMP_FILE" "$SCOPE_STAMP_FILE.tmp" "${LOGS_DIR:?}"/iter* 2>/dev/null || true
+    fi
 
     if [[ "$FROM_PHASE" -gt 1 ]]; then
         verify_resume_artifacts "$FROM_PHASE" "$target_dir" || return 1
@@ -1612,11 +1726,7 @@ run_review_loop() {
         local phase_rc=0
         if [[ $start_phase -le 1 ]]; then
             run_phase_1 "$target_dir" "$iteration" || phase_rc=$?
-            if [[ $phase_rc -eq 0 ]]; then
-                log_success "Review complete - both agents report clean code"
-                update_tracking "status" "clean"
-                return 0
-            elif [[ $phase_rc -eq 2 ]]; then
+            if [[ $phase_rc -eq 2 ]]; then
                 log_error "Halting: no usable agent output in phase 1"
                 update_tracking "status" "agent_failure"
                 return 1
@@ -1624,6 +1734,16 @@ run_review_loop() {
                 log_error "Halting: no source to review - no agent was called"
                 update_tracking "status" "empty_scope"
                 return 1
+            elif iteration_has_failed_call "$iteration"; then
+                # Before the clean return: one agent saying NO_ISSUES beside a
+                # dead one is not two clean reviews.
+                log_error "Halting: an agent call failed in phase 1 - a debate needs both agents"
+                update_tracking "status" "agent_failure"
+                return 1
+            elif [[ $phase_rc -eq 0 ]]; then
+                log_success "Review complete - both agents report clean code"
+                update_tracking "status" "clean"
+                return 0
             fi
             echo ""
         else
@@ -1642,6 +1762,10 @@ run_review_loop() {
                 log_error "Halting: no source to review - phase 2 agents were not called"
                 update_tracking "status" "empty_scope"
                 return 1
+            elif iteration_has_failed_call "$iteration"; then
+                log_error "Halting: an agent call failed in phase 2 - a debate needs both agents"
+                update_tracking "status" "agent_failure"
+                return 1
             fi
             echo ""
         else
@@ -1656,6 +1780,10 @@ run_review_loop() {
                 log_error "Halting: no usable agent output in phase 3"
                 update_tracking "status" "agent_failure"
                 return 1
+            elif iteration_has_failed_call "$iteration"; then
+                log_error "Halting: an agent call failed in phase 3 - a debate needs both agents"
+                update_tracking "status" "agent_failure"
+                return 1
             fi
             echo ""
         else
@@ -1663,11 +1791,15 @@ run_review_loop() {
         fi
 
         # Phase 4. Return codes: 0 = done, 1 = fixes applied, go round again,
-        # 2 = report-only synthesis produced no usable report.
+        # 2 = the synthesis failed (either mode): no usable report or result.
         phase_rc=0
         run_phase_4 "$target_dir" "$iteration" || phase_rc=$?
         if [[ $phase_rc -eq 2 ]]; then
-            log_error "Halting: synthesis failed - no report was produced"
+            if [[ "$NO_FIX" == "1" ]]; then
+                log_error "Halting: synthesis failed - no report was produced"
+            else
+                log_error "Halting: synthesis failed - it may have edited files before failing; check 'git status' in $target_dir"
+            fi
             update_tracking "status" "agent_failure"
             return 1
         elif [[ $phase_rc -eq 0 ]]; then
@@ -1714,7 +1846,26 @@ show_status() {
         "Recent History:"
     ' "$TRACKING_FILE"
 
-    jq -r '.history | if length == 0 then "  (none)" else .[-10:] | .[] | "  - Iter \(.iteration) \(.phase) [\(.agent)]: \(.result | if type == "object" then .summary // "ok" else . end)"  end' "$TRACKING_FILE" 2>/dev/null || echo "  (none)"
+    # One line per call: the counters that phase reports, then its summary.
+    # Entries written before results were stored as objects are strings of
+    # JSON; they are decoded here so an old tracking.json reads the same.
+    jq -r '
+        def show:
+            (if type == "string" then (fromjson? // .) else . end)
+            | if type != "object" then tostring
+              elif has("error") then "no status (\(.error))"
+              else ( [ to_entries[]
+                       | select(.key != "summary" and .key != "status")
+                       | "\(.key)=\(.value)" ] | join(" ") ) as $fields
+                   | ( [ $fields, (.summary // empty | tostring) ]
+                       | map(select(. != "")) | join(" - ") )
+                   | if . == "" then "ok" else . end
+              end;
+        .history
+        | if length == 0 then "  (none)"
+          else .[-10:] | .[] | "  - Iter \(.iteration) \(.phase) [\(.agent)]: \(.result | show)"
+          end
+    ' "$TRACKING_FILE" 2>/dev/null | tr -d '\r' || echo "  (none)"
 
     echo ""
     echo "Artifacts:"
@@ -1802,7 +1953,7 @@ OPTIONS:
                             Refused unless artifacts/scope.stamp shows they were
                             made for this target and this exact source.
     --changed-only          Review only files with uncommitted git changes,
-                            included in full rather than truncated.
+                            each included up to 3000 lines.
 
 PHASES:
     1. Independent Review   Claude and Codex review code in parallel
@@ -1810,6 +1961,8 @@ PHASES:
     3. Meta-Review          Each reviews feedback on their review
     4. Synthesis            Claude weighs the debate and writes the report;
                             with --fix it also implements the fixes
+    A failed agent call in any phase stops the run (status agent_failure,
+    exit 1): a debate needs both agents.
 
 ENVIRONMENT:
     MAX_ITERATIONS, TIMEOUT_MINUTES, VERBOSE=1, DRY_RUN=1 mirror the flags.
@@ -1819,6 +1972,14 @@ ENVIRONMENT:
                             answer --version
     FIX_MODE_TOOLS=list     Tools the agent gets with --fix
                             (default: Read,Grep,Glob,Edit,Write)
+    READ_ONLY_TOOLS=list    Tools every other Claude call gets
+                            (default: Read,Grep,Glob)
+    MAX_SOURCE_FILES, MAX_SOURCE_LINES, MAX_SOURCE_SHELL_FILES,
+    MAX_SOURCE_SHELL_LINES  Source collection caps: positive integers
+                            (defaults 30, 500, 10, 300)
+    MAX_SOURCE_EXCLUDE=re   Extended regex; matching absolute paths are left
+                            out of the source dump
+    SOURCE_FILE_LIST=file   Review exactly the files listed in this file
 
 CIRCUIT BREAKER:
     Prevents runaway loops by detecting:
@@ -1971,6 +2132,27 @@ main() {
     if [[ "$NO_FIX" != "0" && "$NO_FIX" != "1" ]]; then
         log_error "NO_FIX must be 0 (fix mode) or 1 (report only), got '$NO_FIX'"
         exit 1
+    fi
+
+    # The collector's caps and its exclude regex come from the environment and
+    # were never checked. A non-numeric cap made head fail silently or raised an
+    # arithmetic error inside the dump; a regex grep cannot compile dropped
+    # every file behind filter_excluded's `|| true` and the run ended as
+    # empty_scope, as if the target had no source.
+    local cap_name exclude_rc=0
+    for cap_name in MAX_SOURCE_FILES MAX_SOURCE_LINES MAX_SOURCE_SHELL_FILES MAX_SOURCE_SHELL_LINES; do
+        if ! [[ "${!cap_name}" =~ ^[1-9][0-9]*$ ]]; then
+            log_error "$cap_name must be a positive integer, got '${!cap_name}'"
+            exit 1
+        fi
+    done
+    if [[ -n "$MAX_SOURCE_EXCLUDE" ]]; then
+        # grep exits 2 for a pattern it cannot compile, 1 for "no match".
+        grep -E -- "$MAX_SOURCE_EXCLUDE" < /dev/null > /dev/null 2>&1 || exclude_rc=$?
+        if [[ $exclude_rc -ge 2 ]]; then
+            log_error "MAX_SOURCE_EXCLUDE is not a valid extended regular expression: '$MAX_SOURCE_EXCLUDE'"
+            exit 1
+        fi
     fi
 
     # Fail here rather than in collect_source_code: its caller reads it through

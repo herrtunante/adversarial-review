@@ -72,6 +72,20 @@ can_execute() {
     [[ "$state" != "$CB_STATE_OPEN" ]]
 }
 
+# cb_count VALUE - VALUE when it is a plain decimal of at most 9 digits, else 0.
+# [[ -gt ]] and $(( )) evaluate their operands as arithmetic, and a subscript
+# such as a[$(cmd)] runs cmd. fixes_made can be an agent's self-reported
+# FILES_MODIFIED (non-git targets), so nothing reaches a comparison or a sum
+# below without passing through here - the counters read back from the state
+# file included, which costs nothing and leaves no unchecked path.
+cb_count() {
+    if [[ "${1:-}" =~ ^[0-9]{1,9}$ ]]; then
+        echo "$((10#$1))"
+    else
+        echo 0
+    fi
+}
+
 # Record iteration result
 # Args: iteration, fixes_made (0/1), agents_agree (0/1), issues_hash
 record_iteration_result() {
@@ -79,6 +93,13 @@ record_iteration_result() {
     local fixes_made=$2
     local agents_agree=$3
     local issues_hash=${4:-""}
+
+    iteration=$(cb_count "$iteration")
+    fixes_made=$(cb_count "$fixes_made")
+    agents_agree=$(cb_count "$agents_agree")
+    # The fingerprint is a hex digest; anything else would be written into the
+    # state file's JSON as it is.
+    [[ "$issues_hash" =~ ^[0-9A-Za-z]*$ ]] || issues_hash=""
 
     init_circuit_breaker
 
@@ -91,10 +112,10 @@ record_iteration_result() {
     local last_progress=$(echo "$state_data" | jq -r '.last_progress_iteration' | tr -d '[:space:]')
 
     # Ensure integers
-    no_progress=$((no_progress + 0))
-    disagreement=$((disagreement + 0))
-    same_issues=$((same_issues + 0))
-    last_progress=$((last_progress + 0))
+    no_progress=$(cb_count "$no_progress")
+    disagreement=$(cb_count "$disagreement")
+    same_issues=$(cb_count "$same_issues")
+    last_progress=$(cb_count "$last_progress")
 
     # Update counters based on results
     if [[ $fixes_made -gt 0 ]]; then
@@ -161,7 +182,7 @@ record_iteration_result() {
 
     # Update total opens
     local total_opens=$(echo "$state_data" | jq -r '.total_opens' | tr -d '[:space:]')
-    total_opens=$((total_opens + 0))
+    total_opens=$(cb_count "$total_opens")
     if [[ "$new_state" == "$CB_STATE_OPEN" && "$current_state" != "$CB_STATE_OPEN" ]]; then
         total_opens=$((total_opens + 1))
     fi
@@ -291,6 +312,7 @@ reset_circuit_breaker() {
 }
 
 # Export functions
+export -f cb_count
 export -f init_circuit_breaker
 export -f get_circuit_state
 export -f can_execute

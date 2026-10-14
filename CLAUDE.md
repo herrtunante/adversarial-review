@@ -34,7 +34,10 @@ Report-only is the default since the self-review of October 2026; fixing needs `
 
 Env vars override the flags: `MAX_ITERATIONS`, `TIMEOUT_MINUTES`, `VERBOSE=1`, `DRY_RUN=1`,
 `NO_FIX` (0 or 1), `FROM_PHASE`, `CODEX_BIN` (used as given; the run stops if it does not answer
-`--version`), `FIX_MODE_TOOLS` (the tool list for fix mode), plus
+`--version`), `FIX_MODE_TOOLS` (the tool list for fix mode), `READ_ONLY_TOOLS` (the tool list for
+every other Claude call), the collector settings `MAX_SOURCE_FILES`, `MAX_SOURCE_LINES`,
+`MAX_SOURCE_SHELL_FILES`, `MAX_SOURCE_SHELL_LINES` (positive integers, checked at startup),
+`MAX_SOURCE_EXCLUDE` (must compile as an extended regex) and `SOURCE_FILE_LIST`, plus
 the circuit-breaker thresholds `CB_NO_PROGRESS_THRESHOLD`, `CB_DISAGREEMENT_THRESHOLD`,
 `CB_SAME_ISSUES_THRESHOLD`.
 
@@ -77,9 +80,20 @@ Two Windows-specific problems have been fixed in the script; don't reintroduce t
 
 ### Agent CLI invocation (verified against codex-cli 0.147.0 / claude 2.1.296)
 
-Phases 1 to 3 and a report-only phase 4 run plain `claude --print`. Fix mode runs
-`claude --print --tools Read,Grep,Glob,Edit,Write --allowedTools Read,Grep,Glob,Edit,Write`:
-`--tools` removes the shell, `--allowedTools` pre-approves the rest. It replaced
+Every Claude call names its tools and ignores the target's own configuration:
+
+```
+claude --print --tools Read,Grep,Glob --allowedTools Read,Grep,Glob \
+       --setting-sources user --strict-mcp-config                    # phases 1-3, report-only phase 4
+claude --print --tools Read,Grep,Glob,Edit,Write --allowedTools Read,Grep,Glob,Edit,Write \
+       --setting-sources user --strict-mcp-config                    # fix-mode synthesis
+```
+
+`--tools` removes every other built-in tool, the shell included; `--allowedTools` pre-approves the
+rest, which `--print` needs because nobody is there to answer a prompt. `--setting-sources user`
+stops the target's project and local settings (and its hooks) from loading, and
+`--strict-mcp-config` loads no MCP servers at all, the user's own included. Before, only fix mode
+named its tools, so "report-only cannot write" was not enforced. The fix-mode list replaced
 `--dangerously-skip-permissions`, because the phase-4 prompt quotes the target's source and a
 comment planted there could reach an agent with unrestricted shell access. The cost is that the
 fixing agent cannot run tests or git, and an allowlist is not filesystem containment: use `--fix`
@@ -135,11 +149,16 @@ Treat running `--fix` against a dirty working tree as destructive — the target
 ### The status-block protocol
 
 Every prompt template ends with a mandated fenced block (`---REVIEW_STATUS---`,
-`---CROSS_REVIEW_STATUS---`, `---META_REVIEW_STATUS---`, `---SYNTHESIS_STATUS---`). The script's
-`parse_status_block()` takes the last complete block in the file (an earlier one can be an example
-quoted in prose) and builds JSON from its `KEY: value` pairs with `jq`, so any summary text gives
-valid JSON. That JSON drives every control decision (loop exit, circuit-breaker input, tracking
-history). An unterminated block counts as no block.
+`---CROSS_REVIEW_STATUS---`, `---META_REVIEW_STATUS---`, `---SYNTHESIS_STATUS---`). What counts as
+a block is defined once, in `extract_status_block` in `lib/transient.sh`, and shared by
+`parse_status_block()`, the aggregator and `chunk_is_reviewed`, so they cannot disagree. It takes
+the last complete block in the file (an earlier one can be an example quoted in prose); a
+delimiter counts only on a line of its own; and a block opened after the last complete one and
+never closed makes the file invalid, because that is a truncated answer. `parse_status_block()`
+builds JSON from the block's `KEY: value` pairs with `jq`, so any summary text gives valid JSON.
+That JSON drives every control decision (loop exit, circuit-breaker input, tracking history).
+Counters from a block are never trusted as numbers: anything that is not plain digits reads as 0
+before it reaches shell arithmetic, because a value like `a[$(cmd)]` would otherwise run `cmd`.
 
 Consequences worth knowing before editing prompts or the parser:
 
@@ -152,7 +171,7 @@ Consequences worth knowing before editing prompts or the parser:
 
 ### Exit conditions
 
-The loop ends when both phase-1 agents report `exit_signal: true`; when phase-4 synthesis reports
+The loop ends when both phase-1 agents report `exit_signal: true` and zero issues; when phase-4 synthesis reports
 `EXIT_SIGNAL: true`; on `MAX_ITERATIONS`; or when the circuit breaker is `OPEN`. Final state lands
 in `tracking.json` as `clean` / `circuit_open` / `max_iterations`, or `report_only` for a `--no-fix`
 run. Two more statuses mean the run did not do its job, and both exit non-zero: `agent_failure` (see
@@ -190,10 +209,14 @@ start of a run whose target differs from the previous one, unless the breaker is
 
 ### Agent failure handling
 
-`wait_for_agents` replaces the old `wait $pid || true`. Exit codes are no longer discarded: a
-single agent failure logs and degrades, both failing returns `2`, which each phase propagates so
-`run_review_loop` halts with `status: agent_failure`. A synthesis that fails, or writes no complete
-status block, ends the same way in report-only mode instead of as `report_only`. Without this, a crashed or timed-out agent
+`wait_for_agents` replaces the old `wait $pid || true`. Exit codes are no longer discarded, and a
+debate needs both agents: after each of phases 1 to 3, one failed call (a failure note or an empty
+artifact) halts the run with `status: agent_failure` and exit 1, instead of passing the failure note
+on as "the other agent's review". A synthesis that fails, or writes no complete status block, ends
+the same way in both modes, before the breaker is fed and before another iteration starts. A Codex
+call that exits non-zero always leaves the failure note, even if it wrote a partial answer.
+Agent timeouts send KILL 30 seconds after TERM (`timeout -k 30s`, when the timeout supports it);
+exit 137 is reported as killed. Without this, a crashed or timed-out agent
 produced an artifact with no status block, which parses to zero issues and is indistinguishable
 from a clean review — the loop would burn every remaining iteration on empty input.
 
@@ -262,7 +285,19 @@ the driver removes and rewrites, and ids must be unique. `run_filelist_review.sh
 rule to the list file names it takes its ids from.
 
 The driver exits 0 only when every selected chunk is reviewed or was recorded as empty, 1 for bad
-arguments or a bad manifest, and 2 when one or more chunks failed. It used to exit 0 regardless.
+arguments or a bad manifest, 2 when one or more chunks failed, 3 when the agents did not recover from a quota wait, 4 when
+another driver holds the lock, and 130 or 143 on INT or TERM. It used to exit 0 regardless. Its
+verdict for a chunk is `chunk_is_reviewed`, not the review's exit code: a reviewed chunk whose
+review exited non-zero (a `--fix` chunk ending at `max_iterations`) is done, with the code noted in
+`index.tsv` as e.g. `max_iterations(rc=1)`, and a chunk the function rejects is failed, noted as
+e.g. `report_only(incomplete)`. A run and the next `--resume` therefore agree.
+
+Each attempt at a chunk starts from nothing: the chunk's output directory, `artifacts/iter*`,
+`scope.stamp`, `logs/iter*` and the working `tracking.json` are removed first, so a rerun cannot
+merge into an older result. The driver and the wrapper also unset `CHANGED_ONLY`,
+`SOURCE_FILE_LIST`, `FROM_PHASE`, `NO_FIX` and the `MAX_SOURCE_*` caps from the caller's
+environment and set the scope of every review themselves. `--list` creates nothing, and a
+`--dry-run` refuses to overwrite a chunk that is already reviewed.
 
 Things the driver has to do because state in this repo is global, not per-run:
 
@@ -290,18 +325,24 @@ Things the driver has to do because state in this repo is global, not per-run:
 
 `chunk_is_reviewed` in `lib/transient.sh` is the one answer to "is this chunk reviewed?", shared by
 the driver, the supervisor, the file-list wrapper and the aggregator. The newest synthesis report
-(by iteration number) must hold a complete `SYNTHESIS_STATUS` block, and no artifact may be a failed
-agent call: a quota or connection error, an empty file, or the `CODEX PRODUCED NO FINAL MESSAGE`
-note `run_codex` writes when Codex gives no answer, whatever the cause. A chunk both agents found
+(by iteration number) must hold a complete `SYNTHESIS_STATUS` block, and no artifact of the newest
+iteration, nor of the iteration that synthesis belongs to, may be a failed agent call: a quota or
+connection error, an empty file, or the `CODEX PRODUCED NO FINAL MESSAGE` / `CLAUDE PRODUCED NO
+OUTPUT` note an agent call leaves when it gives no answer, whatever the cause. A failure in an
+earlier iteration of a `--fix` run no longer counts once a later iteration is complete. A chunk both agents found
 clean in phase 1 has no synthesis; it counts through `status: clean` in its `tracking.json`.
 `--resume` redoes any chunk the function rejects.
 
-A chunk is only archived as done if it also survives three checks:
+Besides that, the driver has these reasons to redo a chunk:
 
 - **Transient failure.** A quota refusal or a dropped network does not stop a phase. The agent
   writes a one-line error in place of the review, which parses to zero issues and looks exactly
-  like clean code. `artifact_is_transient_failure` recognises two shapes: a short file (under 2 KB)
-  holding a quota or connection error, or Codex's timestamped transport `ERROR` lines. The broad
+  like clean code. `artifact_is_transient_failure` recognises three shapes: a short file (under 2 KB)
+  holding a quota or connection error; a Codex transcript, which opens with the Codex banner in
+  its first five lines, containing a quota phrase; and Codex's timestamped transport `ERROR`
+  lines, which only count in a transcript, a failure note or a file that is not a real answer.
+  Matching the banner or an `ERROR` line anywhere once threw away a complete self-review whose
+  agents quoted them from this tool's source. Only the newest iteration is judged. The broad
   phrases are only trusted in short files; in a full review they match findings about rate
   limiting. A short file with a complete status block or a bare `NO_ISSUES` is a real answer and is
   never treated as a refusal. On a hit the driver waits
@@ -313,9 +354,11 @@ A chunk is only archived as done if it also survives three checks:
 - **Scope contamination.** The Codex transcript echoes the prompt, so its `=== FILE:` markers are a
   record of what the agent was really shown. Any path the chunk's exclude regex would have dropped
   means the artifacts came from another run.
-- **Salvage.** If only synthesis failed, the six debate artifacts are kept and the retry runs
-  `adversarial_review.sh --from-phase 4`, costing one agent call instead of seven. A debate with
-  any failed call in it is not salvaged. `verify_resume_artifacts` refuses to start mid-run if an
+- **Salvage.** If only synthesis failed, or it wrote no complete status block, the six debate
+  artifacts are kept and the retry runs `adversarial_review.sh --from-phase 4`, costing one agent
+  call instead of seven. A debate with any failed call in it, or with files of more than one
+  iteration, is not salvaged; `--from-phase` refuses a multi-iteration debate too, because
+  `scope.stamp` describes the last iteration's source while the saved files may be the first's. `verify_resume_artifacts` refuses to start mid-run if an
   earlier artifact is missing, under 200 bytes or a failure note, or if `artifacts/scope.stamp`
   does not match. Phase 1 writes that stamp (the canonical target path and a hash of the source
   dump) so a saved debate cannot be resumed against another target or changed source; the same
@@ -336,8 +379,11 @@ exceeds. The supervisor restarts it with `--resume` until `chunk_is_reviewed` ac
 driver would run, and waits for any driver already running rather than starting a second. It
 respects `--only`, does not count chunks the driver recorded as empty, and gives up on chunks that
 still fail after two extra passes. `--target`, `-o` and the manifest are resolved from the
-directory it was started in. A manifest the driver rejects (exit 1) is not told apart from a crash,
-so the supervisor retries it every five minutes; check the manifest with `--list` first. A saved debate sits beside
+directory it was started in. It decides from the exit code of the driver it last ran,
+not from `driver.log`. It exits 0 only when every chunk is reviewed or empty; 1 when the driver
+rejected its arguments or manifest (not retried); 2 when chunks still fail after the extra passes
+or the driver keeps exiting unexpectedly; 3 when the agent CLIs never came back. It is report-only
+and refuses `--fix`. A saved debate sits beside
 the chunk directory as `<out>/.salvage-<chunk>/`, so it survives those restarts. To change the
 driver while a run is live, stage the new version as `run_chunked_review.next.sh`; the supervisor
 installs it only in the gap between driver runs, because bash reads a script as it executes and an
@@ -356,7 +402,9 @@ scattered across directories or repos), use `run_filelist_review.sh` with one `S
 file per chunk. It archives each chunk the same way, skips chunks `chunk_is_reviewed` accepts, and
 runs `aggregate_review.sh` at the end. It is report-only and simpler than the driver: a few retries
 per chunk, no waiting out a quota reset, no salvage. It takes the same `.driver.lock` (exit 4 if a
-driver or another wrapper holds it) and does not retry a chunk that ended as `empty_scope`.
+driver or another wrapper holds it, and also for a live `.review.lock`), does not retry a chunk
+that ended as `empty_scope`, and exits non-zero when the aggregate fails. Unknown options are errors
+in all the wrappers, as are value flags given without a value.
 
 ```bash
 nohup ./run_filelist_review.sh --target ../whisp -o reviews/whisp chunks/whisp/*.files > reviews/whisp.log 2>&1 &
@@ -390,8 +438,10 @@ halves rather than dividing it.
   `sha256sum`/`shasum`/`cksum` so the circuit breaker works on Linux, macOS, and Git Bash alike.
 - **`set -e` + `((i++))`**: incrementing from 0 returns exit 1 and would kill the script. Existing
   code uses `((iteration++)) || true`; keep that pattern.
-- Timeouts go through `get_timeout_cmd`, preferring `gtimeout` (macOS coreutils) then `timeout`.
-  With neither, agent calls run unbounded — only a warning is printed.
+- Timeouts go through `get_timeout_cmd`, preferring `gtimeout` (macOS coreutils) then `timeout`,
+  with `-k 30s` when supported. With neither, agent calls run unbounded — only a warning is printed.
+- A standalone run that starts at phase 1 clears `artifacts/iter*`, `scope.stamp` and `logs/iter*`
+  first. Archive anything you want to keep from the previous run before starting another.
 - Cost: ~7 agent invocations per iteration (2+2+2+1), so the default report-only run is 7 calls and a 3-iteration `--fix` run is ~21.
   No cost tracking exists. Use `--dry-run` for anything structural.
 

@@ -81,20 +81,37 @@ usage() {
     echo "  --max-lines N      per-file line cap handed to the collector (default: 500)"
 }
 
+# A flag that takes a value must be followed by one. Without the check a flag
+# given last died with "unbound variable", and one followed by another flag
+# swallowed that flag as its value.
+need_arg() {
+    if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+        err "$1 needs a value"
+        exit 1
+    fi
+}
+# No leading zero: bash arithmetic would read 08 as a bad octal number.
+need_int() {
+    if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+        err "$1 must be a positive integer, got '$2'"
+        exit 1
+    fi
+}
+
 MANIFEST=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)       TARGET_ROOT="$2"; shift 2 ;;
-        -o|--out)       OUT_DIR="$2"; shift 2 ;;
-        -t|--timeout)   TIMEOUT_MIN="$2"; shift 2 ;;
-        -m|--max-iters) MAX_ITERS="$2"; shift 2 ;;
+        --target)       need_arg "$@"; TARGET_ROOT="$2"; shift 2 ;;
+        -o|--out)       need_arg "$@"; OUT_DIR="$2"; shift 2 ;;
+        -t|--timeout)   need_arg "$@"; need_int "$1" "$2"; TIMEOUT_MIN="$2"; shift 2 ;;
+        -m|--max-iters) need_arg "$@"; need_int "$1" "$2"; MAX_ITERS="$2"; shift 2 ;;
         --fix)          FIX=1; shift ;;
-        --only)         ONLY_GLOB="$2"; shift 2 ;;
+        --only)         need_arg "$@"; ONLY_GLOB="$2"; shift 2 ;;
         --resume)       RESUME=1; shift ;;
         --list)         LIST_ONLY=1; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
-        --max-files)    SRC_FILES="$2"; shift 2 ;;
-        --max-lines)    SRC_LINES="$2"; shift 2 ;;
+        --max-files)    need_arg "$@"; need_int "$1" "$2"; SRC_FILES="$2"; shift 2 ;;
+        --max-lines)    need_arg "$@"; need_int "$1" "$2"; SRC_LINES="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         -*)             err "unknown option: $1"; usage; exit 1 ;;
         *)              MANIFEST="$1"; shift ;;
@@ -107,11 +124,21 @@ done
 [[ -d "$TARGET_ROOT" ]] || { err "target not found: $TARGET_ROOT"; exit 1; }
 TARGET_ROOT="$(cd "$TARGET_ROOT" && pwd)"
 
+# A chunk's scope comes from the manifest and the options above, and from
+# nothing else. The review reads all of these from the environment, so a value
+# exported in the caller's shell would be inherited by every chunk: CHANGED_ONLY
+# is tested before anything else in the collector and would replace the chunk
+# with the target's uncommitted files, still archived as a complete review.
+# FROM_PHASE and the fix mode are passed as flags (--from-phase, --fix/--no-fix);
+# the MAX_SOURCE_* values are set on every review started below.
+unset CHANGED_ONLY SOURCE_FILE_LIST FROM_PHASE NO_FIX
+unset MAX_SOURCE_FILES MAX_SOURCE_LINES MAX_SOURCE_SHELL_FILES MAX_SOURCE_SHELL_LINES MAX_SOURCE_EXCLUDE
+
+# The output directory is only named here. It is created after the --list block:
+# planning must not leave an empty reviews/<name>-<timestamp>/ behind every time.
 if [[ -z "$OUT_DIR" ]]; then
     OUT_DIR="$SCRIPT_DIR/reviews/$(basename "$TARGET_ROOT")-$(date +%Y%m%d-%H%M%S)"
 fi
-mkdir -p "$OUT_DIR"
-OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 # Escape a path fragment for use inside an extended-regex alternation.
 re_escape() {
@@ -415,6 +442,24 @@ debate_dir_is_intact() {
 
 chunk_debate_is_intact() { debate_dir_is_intact "$1/artifacts"; }
 
+# Salvage is for a single-iteration debate only. scope.stamp is rewritten every
+# iteration, so after two iterations it describes the source as the LAST one saw
+# it, while the files that would be saved are the first one's: a fix run would
+# then synthesise findings about code iteration 1 had already changed. Such a
+# chunk is reviewed again in full. The pattern is a glob, so iter10_ is not
+# taken for iter1_.
+chunk_is_single_iteration() {
+    local f
+    for f in "$1"/artifacts/iter*_*.md; do
+        [[ -f "$f" ]] || continue
+        case "${f##*/}" in
+            iter1_*) ;;
+            *)       return 1 ;;
+        esac
+    done
+    return 0
+}
+
 # Line 1 of a scope stamp is the canonical target the debate was written about.
 # Checked here so a saved debate left under a chunk id that now names another
 # module is dropped without spending the synthesis call on it. The source hash
@@ -469,12 +514,44 @@ nap() {
     wait $! || true
 }
 
-probe_claude() {
+# The time limit for one probe, as words to put in front of the command: empty
+# when there is no timeout program. -k sends KILL 30 seconds after the TERM, for
+# a CLI that ignores TERM and would otherwise hold the probe (and so the whole
+# wait) for good. It is used only where the installed timeout accepts it; an old
+# BusyBox one does not.
+PROBE_TIMEOUT_PREFIX=""
+PROBE_TIMEOUT_RESOLVED=0
+resolve_probe_timeout() {
     local tcmd
+    [[ "$PROBE_TIMEOUT_RESOLVED" == "1" ]] && return 0
+    PROBE_TIMEOUT_RESOLVED=1
+    PROBE_TIMEOUT_PREFIX=""
     tcmd="$(get_timeout_cmd)"
-    # $tcmd is deliberately unquoted: empty means "run without a time limit".
+    [[ -n "$tcmd" ]] || return 0
+    if "$tcmd" -k 1s 5s true > /dev/null 2>&1; then
+        PROBE_TIMEOUT_PREFIX="$tcmd -k 30s 120s"
+    else
+        PROBE_TIMEOUT_PREFIX="$tcmd 120s"
+    fi
+    return 0
+}
+
+# Claude counts as answering when the call exits 0 and its reply holds OK as a
+# word of its own, in any case and with anything around it: "**OK**", " OK" and
+# "ok." are all answers. Requiring the reply to START with OK failed every probe
+# of a CLI that wraps its answer in markdown, until the two-hour limit. A
+# non-zero exit is still a failure, and so is refusal text that happens to
+# contain the word.
+probe_claude() {
+    local out
+    resolve_probe_timeout
+    # The prefix is deliberately unquoted: it is several words, or none at all
+    # ("run without a time limit"). The prompt is a here-string, not a pipe, so
+    # pipefail cannot fail the probe on the writing side.
     # shellcheck disable=SC2086
-    echo "Reply with exactly: OK" | ${tcmd:+$tcmd 120s} claude --print 2>&1 | grep -qi '^OK'
+    out="$($PROBE_TIMEOUT_PREFIX claude --print 2>&1 <<< "Reply with exactly: OK")" || return 1
+    grep -qEi -- "$TRANSIENT_SHORT_RE" <<< "$out" && return 1
+    grep -qiE '(^|[^[:alnum:]])OK([^[:alnum:]]|$)' <<< "$out"
 }
 
 # One tiny `codex exec`, invoked the way run_codex invokes it. It counts as an
@@ -482,9 +559,9 @@ probe_claude() {
 # nor the transcript carries usage-limit or transport-error text: a refused
 # codex can still exit 0.
 probe_codex() {
-    local tcmd tmp_msg tmp_log tmp_dir rc=0
+    local tmp_msg tmp_log tmp_dir rc=0
     resolve_probe_codex_bin || return 1
-    tcmd="$(get_timeout_cmd)"
+    resolve_probe_timeout
     # Space-free paths, and a cwd that is not this repo: see run_codex.
     tmp_dir="$(mktemp -d -t ar_probe_XXXXXX 2>/dev/null)" || tmp_dir=""
     [[ -n "$tmp_dir" && -d "$tmp_dir" ]] || return 1
@@ -492,7 +569,7 @@ probe_codex() {
     tmp_log="$tmp_dir/log"
     # shellcheck disable=SC2086
     ( cd "$tmp_dir" && printf '%s' "Reply with exactly: OK" \
-        | ${tcmd:+$tcmd 120s} "$PROBE_CODEX_BIN" exec --sandbox read-only --skip-git-repo-check -o "$tmp_msg" - ) \
+        | $PROBE_TIMEOUT_PREFIX "$PROBE_CODEX_BIN" exec --sandbox read-only --skip-git-repo-check -o "$tmp_msg" - ) \
         > "$tmp_log" 2>&1 || rc=$?
     if [[ $rc -eq 0 ]]; then
         [[ -s "$tmp_msg" ]] || rc=1
@@ -695,6 +772,9 @@ if [[ "$LIST_ONLY" == "1" ]]; then
 fi
 
 # --- run ---------------------------------------------------------------------
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+
 info "target   : $TARGET_ROOT"
 info "manifest : $MANIFEST"
 info "output   : $OUT_DIR"
@@ -731,9 +811,12 @@ for i in "${!IDS[@]}"; do
         info "$cid: already done, skipping"
         continue
     fi
-    if [[ "$RESUME" == "1" && -d "$chunk_out" ]]; then
-        warn "$cid: previous attempt incomplete, re-running"
-        rm -rf "$chunk_out"
+    # A dry run only writes stubs. It must not replace a real review: the old
+    # output of this chunk is removed below, before the first attempt.
+    if [[ "$DRY_RUN" == "1" ]] && chunk_is_complete "$chunk_out"; then
+        err "$cid: refusing to dry-run over a completed review in $chunk_out"
+        failed=$((failed + 1))
+        continue
     fi
 
     module_abs="$TARGET_ROOT/${MODULES[$i]}"
@@ -784,12 +867,11 @@ for i in "${!IDS[@]}"; do
       fi
   fi
   while true; do
-    mkdir -p "$chunk_out"
-    printf '%s\n' "$exclude" > "$chunk_out/exclude.regex"
-
-    # artifacts/, logs/ and the circuit breaker are global to this repo, so clear
-    # them per chunk. Without this a chunk can inherit the previous chunk's OPEN
-    # breaker, or archive a log file that a previous chunk wrote.
+    # artifacts/, logs/, tracking.json and the circuit breaker are global to this
+    # repo, so clear them per chunk. Without this a chunk can inherit the previous
+    # chunk's OPEN breaker, or archive a log file that a previous chunk wrote, or
+    # - when its review exits before it writes tracking.json - be recorded with
+    # the previous chunk's status.
     #
     # This is deliberately NOT `--reset`: reset_all() deletes .review.lock, which
     # is the only thing preventing a second review from interleaving with a live
@@ -807,8 +889,30 @@ for i in "${!IDS[@]}"; do
         warn "removing stale lock left by pid ${holder:-unknown}"
         rm -f "$SCRIPT_DIR/.review.lock"
     fi
+
+    # The archive step below copies INTO the chunk directory, so whatever an
+    # earlier run left there would be merged with this attempt's files: a rerun
+    # that ends clean in phase 1 kept the old synthesis report, and the
+    # aggregator then published findings for a chunk recorded as clean. Every
+    # attempt therefore starts from an empty chunk directory, with or without
+    # --resume. A saved debate is not affected: it lives beside the directory.
+    # Done after the lock check above, so a refused start deletes nothing.
+    if [[ -d "$chunk_out" ]]; then
+        if [[ "$attempt" -eq 1 ]]; then
+            if [[ "$RESUME" == "1" ]]; then
+                warn "$cid: previous attempt incomplete, re-running"
+            else
+                warn "$cid: replacing the output of an earlier run"
+            fi
+        fi
+        rm -rf "$chunk_out"
+    fi
+    mkdir -p "$chunk_out"
+    printf '%s\n' "$exclude" > "$chunk_out/exclude.regex"
+
     rm -rf "${SCRIPT_DIR:?}/artifacts"/* 2>/dev/null || true
-    rm -f "${SCRIPT_DIR:?}/logs"/iter*.log 2>/dev/null || true
+    rm -f "${SCRIPT_DIR:?}/logs"/iter* 2>/dev/null || true
+    rm -f "${SCRIPT_DIR:?}/tracking.json" 2>/dev/null || true
     "$REVIEW_SH" --reset-circuit > /dev/null 2>&1 || true
 
     # A salvaged debate goes back into artifacts/ AFTER the clear above, so the
@@ -868,7 +972,7 @@ for i in "${!IDS[@]}"; do
     # answer again, and redo it - otherwise the loop races through every
     # remaining chunk producing empty artifacts that look like clean reviews.
     #
-    # Three reasons to redo a chunk, and only the first is worth waiting for:
+    # Five reasons to redo a chunk, and only the first is worth waiting for:
     #   transient    a quota or network failure - wait until both agents answer
     #   scope        the artifacts came from another run - redo at once
     #   failed call  an agent gave no answer for another reason (a Codex timeout
@@ -878,27 +982,41 @@ for i in "${!IDS[@]}"; do
     # A fourth: a saved debate that adversarial_review.sh refused to resume from
     # (its scope stamp no longer matches the target) is dropped and the chunk is
     # reviewed in full.
+    # A fifth: the synthesis call answered, but its report has no complete status
+    # block, so the chunk does not count as reviewed. That is not a failed call
+    # (there is text, and the call may have exited 0), so none of the reasons
+    # above fires, and the chunk used to be recorded as failed and reviewed again
+    # in full, seven calls, on the next --resume. It is a redo reason only when
+    # the debate can be kept: the retry is then the synthesis call alone.
     redo=""
     scope_ok=1
     chunk_scope_is_intact "$chunk_out" "$module_abs" "$exclude" || scope_ok=0
+    synth_file="$(latest_iter_artifact "$chunk_out/artifacts" 4_synthesis.md)"
     if chunk_hit_transient_failure "$chunk_out"; then
         redo="transient"
     elif [[ $scope_ok -eq 0 ]]; then
         redo="scope"
     elif chunk_has_failed_call "$chunk_out"; then
         redo="failed_call"
-    elif [[ "$ran_from_phase" -gt 1 && $rc -ne 0 \
-            && -z "$(latest_iter_artifact "$chunk_out/artifacts" 4_synthesis.md)" ]]; then
+    elif [[ "$ran_from_phase" -gt 1 && $rc -ne 0 && -z "$synth_file" ]]; then
         redo="stale_debate"
+    elif [[ "$DRY_RUN" != "1" && -n "$synth_file" ]] \
+         && ! chunk_is_complete "$chunk_out" \
+         && ! artifact_has_block "$synth_file" SYNTHESIS_STATUS \
+         && chunk_debate_is_intact "$chunk_out" \
+         && chunk_is_single_iteration "$chunk_out"; then
+        redo="no_synthesis"
     fi
     if [[ -n "$redo" ]]; then
         # Keep the debate if it survived and only synthesis failed; that is six
-        # of the chunk's seven agent calls.
+        # of the chunk's seven agent calls. Only a single-iteration debate: see
+        # chunk_is_single_iteration.
         resume_phase=1
         salvage_dir=""
         rm -rf "$OUT_DIR/.salvage-$cid"
         if [[ "$redo" != "stale_debate" && $scope_ok -eq 1 ]] \
-           && chunk_debate_is_intact "$chunk_out"; then
+           && chunk_debate_is_intact "$chunk_out" \
+           && chunk_is_single_iteration "$chunk_out"; then
             salvage_dir="$OUT_DIR/.salvage-$cid"
             mkdir -p "$salvage_dir"
             cp "$chunk_out"/artifacts/iter1_[123]_*.md "$salvage_dir/" 2>/dev/null || true
@@ -912,6 +1030,7 @@ for i in "${!IDS[@]}"; do
             scope)        warn "$cid: attempt $attempt/$max_attempts was scope-contaminated - discarding" ;;
             failed_call)  warn "$cid: attempt $attempt/$max_attempts has an agent call that produced no answer - discarding" ;;
             stale_debate) warn "$cid: attempt $attempt/$max_attempts: the saved debate was not accepted (rc=$rc) - discarding it, reviewing in full" ;;
+            no_synthesis) warn "$cid: attempt $attempt/$max_attempts: the synthesis report has no complete status block (rc=$rc) - discarding it" ;;
         esac
         rm -rf "$chunk_out"
         if (( attempt >= max_attempts )); then
@@ -939,15 +1058,31 @@ for i in "${!IDS[@]}"; do
         status=$(jq -r '.status // "unknown"' "$chunk_out/tracking.json" 2>/dev/null || echo unknown)
         iters=$(jq -r '.iteration // 0' "$chunk_out/tracking.json" 2>/dev/null || echo 0)
     fi
-    if [[ $rc -ne 0 ]]; then
-        status="${status}(rc=$rc)"
+    # The verdict is chunk_is_reviewed, the same test --resume and the supervisor
+    # apply, and not the review's exit code. The two used to disagree: a --fix
+    # chunk that ended max_iterations exits 1 and was counted as failed here,
+    # while the next --resume skipped it as done. Now a chunk the test accepts is
+    # done whatever the review exited with (the code is noted in the index), and
+    # one it rejects is failed even when the review exited 0 (an agent that left
+    # nothing --resume would accept, say). A dry run only writes stubs, which the
+    # test can never accept, so there the exit code is all there is to go by.
+    reviewed=0
+    if [[ "$DRY_RUN" == "1" ]]; then
+        [[ $rc -eq 0 ]] && reviewed=1
+    elif chunk_is_complete "$chunk_out"; then
+        reviewed=1
+    fi
+    [[ $rc -ne 0 ]] && status="${status}(rc=$rc)"
+    if [[ $reviewed -eq 0 ]]; then
+        if [[ $rc -eq 0 ]]; then
+            warn "$cid: review exited 0 but the chunk does not count as reviewed"
+            status="${status}(incomplete)"
+        else
+            warn "$cid: review exited $rc and the chunk does not count as reviewed"
+        fi
         failed=$((failed + 1))
-    elif [[ "$DRY_RUN" != "1" ]] && ! chunk_is_complete "$chunk_out"; then
-        # The review exited 0 but left nothing --resume would accept (an agent
-        # that produced no final message, say). That is a failed chunk, and the
-        # exit code has to say so. A dry run only writes stubs, so it is exempt.
-        warn "$cid: review exited 0 but the chunk does not count as reviewed"
-        failed=$((failed + 1))
+    elif [[ $rc -ne 0 ]]; then
+        warn "$cid: reviewed, although the review exited $rc ($status) - recorded as done"
     fi
 
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$cid" "$nf" "$kb" "$status" "$iters" "$dur" >> "$INDEX"
@@ -955,7 +1090,11 @@ for i in "${!IDS[@]}"; do
     # driver run that this run did not use.
     rm -rf "$OUT_DIR/.salvage-$cid"
     echo "[$cid] $status in ${dur}s" >> "$RUN_LOG"
-    ok "$cid -> $status (${dur}s)"
+    if [[ $reviewed -eq 1 ]]; then
+        ok "$cid -> $status (${dur}s)"
+    else
+        warn "$cid -> $status (${dur}s) - not reviewed"
+    fi
     echo ""
     break
   done
@@ -970,8 +1109,8 @@ fi
 # Exit codes: 0 every selected chunk is reviewed (or was recorded as empty),
 # 1 bad arguments or manifest, 2 one or more chunks failed, 3 the agent CLI did
 # not recover, 4 another review holds .review.lock or another driver or wrapper
-# holds .driver.lock, 130/143 stopped by INT/TERM. supervise_review.sh still
-# reads the "run complete" line above, so that line is printed in both cases.
+# holds .driver.lock, 130/143 stopped by INT/TERM. supervise_review.sh decides
+# what to do next from this code, so it has to stay accurate.
 if [[ $failed -gt 0 ]]; then
     warn "$failed chunk(s) failed - rerun with --resume to redo them"
     exit 2
