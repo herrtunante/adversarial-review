@@ -34,11 +34,17 @@ REVIEW_SH="$SCRIPT_DIR/adversarial_review.sh"
 # AR_STATE_DIR says otherwise. See adversarial_review.sh, which reads the same
 # variable; it is exported so every review started below uses this directory.
 # Made absolute here but only created under "--- run ---": --list creates nothing.
+#
+# Absolute means a leading / or \ (POSIX, UNC), or a Windows drive letter
+# (C:/... or C:\...). Testing only for a leading /, as this did, read the
+# C:/Users/... path the plugin's skill hands over on Windows as relative: the
+# state went to "$PWD/C:/Users/...", inside the plugin's own directory, and
+# every chunk failed. The same rule as the -o check in supervise_review.sh.
 STATE_DIR="${AR_STATE_DIR:-$SCRIPT_DIR}"
-case "$STATE_DIR" in
-    /*) ;;
-    *)  STATE_DIR="$PWD/$STATE_DIR" ;;
-esac
+if [[ "$STATE_DIR" != /* && "$STATE_DIR" != \\* ]] \
+   && ! [[ "$STATE_DIR" == [A-Za-z]:* && ( "${STATE_DIR:2:1}" == / || "${STATE_DIR:2:1}" == '\' ) ]]; then
+    STATE_DIR="$PWD/$STATE_DIR"
+fi
 [[ -d "$STATE_DIR" ]] && STATE_DIR="$(cd "$STATE_DIR" && pwd)"
 export AR_STATE_DIR="$STATE_DIR"
 
