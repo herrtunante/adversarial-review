@@ -1,6 +1,6 @@
 {
   "name": "adversarial-review",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Code review by two different AI providers: Claude and Codex review your project independently, check each other's findings against the code, and agree on one report that says which issues both found, which one confirmed, and which are disputed. Report-only by default. Needs the codex CLI.",
   "author": {
     "name": "herrtunante"

@@ -9,6 +9,16 @@ fixes. The version lives in `.claude-plugin/plugin.json`, and
 Installed plugins only update when this version changes, so every release that
 should reach users bumps it.
 
+## 1.0.1 - 2026-10-15
+
+- Fix: `run_chunked_review.sh` took a Windows path such as `C:/Users/...` in
+  `AR_STATE_DIR` for a relative one, because it only treated paths starting with
+  `/` as absolute. On Windows the plugin's skill passes exactly such a path, so a
+  supervised or chunked run put its state in a stray `C:` folder inside the
+  plugin's directory and every chunk failed within seconds, before any agent was
+  called. Drive-letter paths (`C:/...`, `C:\...`) and network paths (`\\server\...`)
+  are now recognised as absolute, as `supervise_review.sh` already did for `-o`.
+
 ## 1.0.0 - 2026-10-15
 
 First versioned release.
