@@ -3,6 +3,9 @@
   "owner": {
     "name": "herrtunante"
   },
+  "metadata": {
+    "description": "Tools by herrtunante: adversarial-review, code review by Claude and Codex that cross-check each other."
+  },
   "plugins": [
     {
       "name": "adversarial-review",

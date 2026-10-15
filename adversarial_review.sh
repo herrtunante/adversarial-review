@@ -30,6 +30,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$SCRIPT_DIR/lib"
 PROMPTS_DIR="$SCRIPT_DIR/prompts"
+# Holds the version. Set here because the libs sourced below overwrite SCRIPT_DIR.
+PLUGIN_MANIFEST="$SCRIPT_DIR/.claude-plugin/plugin.json"
 
 # Where a run keeps its state: artifacts/, logs/, tracking.json, the circuit
 # breaker and the locks. Next to the script unless AR_STATE_DIR says otherwise.
@@ -2006,6 +2008,7 @@ USAGE:
 
 OPTIONS:
     -h, --help              Show this help
+    --version               Show the version (from .claude-plugin/plugin.json)
     -m, --max-iters N       Max iterations (default: 3)
     -p, --prompt FILE       Custom initial review prompt, used for this run only
                             (prompts/initial_review.md is left untouched)
@@ -2099,6 +2102,16 @@ need_arg() {
     fi
 }
 
+# The version lives in one place, the plugin manifest, so a bug report from a
+# clone and one from an installed plugin name the same thing. sed rather than jq:
+# --version must answer even where jq is missing.
+show_version() {
+    local v
+    v=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$PLUGIN_MANIFEST" 2>/dev/null | head -n 1) || v=""
+    echo "adversarial-review ${v:-unknown}"
+}
+
 main() {
     local target_dir=""
     local custom_prompt=""
@@ -2107,6 +2120,10 @@ main() {
         case "$1" in
             -h|--help)
                 show_help
+                exit 0
+                ;;
+            --version)
+                show_version
                 exit 0
                 ;;
             -m|--max-iters)

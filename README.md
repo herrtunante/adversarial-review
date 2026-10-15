@@ -4,14 +4,26 @@ Multi-agent code review with Claude and GPT Codex in an adversarial debate loop.
 
 Based on patterns from [asimov-ralph](https://github.com/frankbria/ralph-claude-code) and research on [AI Debate](https://arxiv.org/abs/2410.04663).
 
-## Concept
+## Why two providers instead of one review?
 
-Two AI agents (Claude and GPT Codex) independently review code, then critique each other's findings through multiple rounds of debate. This adversarial process helps:
+A single AI review hands you one flat list in which real bugs and confident
+misreadings look the same, so you end up checking every item yourself. Asking the
+same model to double-check mostly reproduces its own view.
 
-- **Find more issues**: Different models catch different problems
-- **Eliminate false positives**: Cross-validation filters out incorrect findings
-- **Build consensus**: Disagreements are resolved through structured debate
-- **Improve confidence**: Issues both agents agree on are high-confidence fixes
+Here Claude and Codex, two models from different companies with different blind
+spots, review the same code independently and then **verify each other's
+findings against the code**, quoting the lines that confirm or refute each one.
+The report you get labels every issue as *found by both*, *found by one and
+confirmed by the other*, or *disputed* (with both positions), so you know what to
+fix first and where to look yourself.
+
+**If you already pay for both** (a Claude plan with Claude Code and a ChatGPT plan
+with Codex), a review costs quota you already have, split across the two
+allowances, rather than money. A run is 7 agent calls, roughly 4–5× the tokens of
+a single review; it is worth it for code that matters, not for every small diff.
+
+The full argument, the costs, when a single review is the better choice, and how
+to measure the difference on your own code: **[docs/WHY.md](docs/WHY.md)**.
 
 ## The 4-Phase Loop
 
@@ -57,7 +69,8 @@ Claude Code (`/adversarial-review`) or Codex instead of by hand.
 ```
 
 Then ask Claude to "run an adversarial review of ../my-project". You still need
-`codex` and `jq` installed (see Requirements).
+`codex` and `jq` installed (see Requirements). Current version: see
+[CHANGELOG.md](CHANGELOG.md), or run `./adversarial_review.sh --version`.
 
 ```bash
 # Clone or copy to your workspace
@@ -220,16 +233,15 @@ Each iteration produces:
 
 ## Research Background
 
-This approach is based on:
+The structure (independent answers, cross-examination, then a judge) follows
+work on multi-agent debate for evaluating model outputs:
 
-- [D3: Debate, Deliberate, Decide](https://arxiv.org/abs/2410.04663) - Adversarial multi-agent evaluation framework
-- [ChatEval](https://github.com/thunlp/ChatEval) - Multi-agent debate for LLM evaluation
-- [AI Debate Research](https://arxiv.org/html/2410.04663v1) - Shows debating LLMs produce more accurate results
+- [D3: Debate, Deliberate, Decide](https://arxiv.org/abs/2410.04663) - adversarial multi-agent evaluation
+- [ChatEval](https://github.com/thunlp/ChatEval) - multi-agent debate for LLM evaluation
 
-Key findings from research:
-- Multi-agent debate reduces hallucinations and false positives
-- 3-7 agents offer the best accuracy-to-cost ratio
-- Adversarial validation improves consensus quality
+Those papers study evaluation tasks, not code review. This tool borrows their
+structure; it does not claim their results, and it has no published benchmark of
+its own yet. [docs/WHY.md](docs/WHY.md) explains how to measure it on your code.
 
 ## Cost Considerations
 
@@ -239,7 +251,11 @@ Each iteration makes 7 agent calls (3 parallel pairs, then one synthesis call):
 - Phase 3: 2 calls (Claude + Codex)
 - Phase 4: 1 call (Claude only)
 
-With 3 iterations max, worst case is ~21 API calls per review.
+A report-only review (the default) is one iteration: 7 calls, or 2 if both agents
+find nothing in phase 1. `--fix` with 3 iterations is at most ~21 calls. Claude makes
+4 of the 7 calls and Codex 3; each receives the source code twice. See
+[docs/WHY.md](docs/WHY.md#the-cost-honestly) for what that means on subscriptions
+versus pay-per-token APIs.
 
 ## Contributing
 

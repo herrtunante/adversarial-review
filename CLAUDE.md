@@ -40,8 +40,16 @@ was loaded as a plugin, because Claude Code replaces `${CLAUDE_PLUGIN_ROOT}` and
 `${CLAUDE_PLUGIN_DATA}` in a plugin skill's text with real paths and leaves them alone otherwise.
 An installed plugin runs from a cache directory that every update replaces, which is why the
 skill sets `AR_STATE_DIR` to the plugin's data directory. Check the manifests with
-`claude plugin validate ./`; `--strict` fails on two warnings that are deliberate: no `version`
-(so each commit is an update) and this file sitting at the plugin root.
+`claude plugin validate ./`; `--strict` fails on one deliberate warning, this file sitting at the
+plugin root.
+
+**Releases.** The version lives only in `.claude-plugin/plugin.json` (`--version` reads it from
+there). Installed plugins update only when it changes, so a change meant for users needs a
+version bump (semver: major for a broken command line, output path or report format, minor for
+features, patch for fixes) and an entry in `CHANGELOG.md`, in the same commit. Commits without
+a bump reach clones but not installed plugins. The case for the approach, which the plugin
+listing points to, is in `docs/WHY.md`; keep its cost figures in line with the phases and
+prompts.
 
 Report-only is the default since the self-review of October 2026; fixing needs `--fix` (or
 `NO_FIX=0`), and `--no-fix` is still accepted. A report-only run is one iteration, 7 agent calls.

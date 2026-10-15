@@ -45,7 +45,9 @@ phase waits for the slower agent.
 
 Is it worth it? For a quick look at a small change, a single agent is cheaper.
 This tool earns its cost when you want a careful review of code that matters and
-you want findings you can trust without checking each one yourself.
+you want findings you can trust without checking each one yourself, and it makes
+the most sense when you already pay for both providers. [WHY.md](WHY.md) sets out
+the full argument, the costs, and how to measure the difference on your own code.
 
 ## 2. Setup
 
@@ -357,9 +359,11 @@ Where things go when it is installed as a plugin:
   place. Manifests and file lists you write with Claude go to
   `~/adversarial-reviews/chunks/`.
 
-The plugin has no version number, so `/plugin update` (or the automatic update)
-brings in each new commit on `main`. You still need `codex`, `jq` and a logged-in
-Claude on the machine (section 2).
+The plugin is versioned (see `CHANGELOG.md`; `./adversarial_review.sh --version`
+prints it). `/plugin update`, or the automatic update, installs a new release when
+the version in `.claude-plugin/plugin.json` changes; commits that do not bump it
+do not reach installed copies. You still need `codex`, `jq` and a logged-in Claude
+on the machine (section 2).
 
 ### 8.1b Using the skill from a clone
 
