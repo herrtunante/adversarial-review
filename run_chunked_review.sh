@@ -658,7 +658,8 @@ probe_codex() {
     if [[ $rc -eq 0 ]]; then
         [[ -s "$tmp_msg" ]] || rc=1
     fi
-    if [[ $rc -eq 0 ]] && grep -qEi -- "$TRANSIENT_SHORT_RE|$TRANSIENT_LOG_RE" "$tmp_msg" "$tmp_log" 2>/dev/null; then
+    if [[ $rc -eq 0 ]] && { grep -qEi -- "$TRANSIENT_SHORT_RE" "$tmp_msg" "$tmp_log" 2>/dev/null \
+                             || has_transport_error "$tmp_msg" "$tmp_log"; }; then
         rc=1
     fi
     rm -rf "$tmp_dir"

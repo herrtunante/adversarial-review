@@ -19,6 +19,24 @@ TRANSIENT_SHORT_RE='hit your (session|usage) limit|usage limit reached|quota exc
 TRANSIENT_SHORT_MAX_BYTES=2048
 TRANSIENT_LOG_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +ERROR .*(stream disconnected|error sending request|connection (reset|refused|closed)|dns error|timed out)'
 TRANSIENT_CODEX_BANNER='OpenAI Codex v'
+# Codex logs a failed background chore as an ERROR line even when the call itself succeeds: it refreshes its model
+# list on start-up and, when that request is slow, logs "failed to refresh available models: request timed out"
+# and then answers normally. Matched as a transport error, that line made every probe and every Codex transcript
+# look refused, so a review stalled with both agents answering.
+TRANSIENT_LOG_BENIGN_RE='failed to refresh available models'
+
+# Does any of the files carry a Codex transport error: a TRANSIENT_LOG_RE line that is not a benign one?
+#
+#   has_transport_error FILE...
+#
+# One awk pass rather than `grep | grep -v`: under `pipefail` a grep killed by the closed pipe turns a match into
+# a failure. Case-insensitive, like the grep -i it replaces; an unreadable file counts as no match.
+has_transport_error() {
+    awk -v re="$TRANSIENT_LOG_RE" -v ok="$TRANSIENT_LOG_BENIGN_RE" \
+        'BEGIN { re = tolower(re); ok = tolower(ok) }
+         { l = tolower($0) } l ~ re && l !~ ok { f = 1; exit }
+         END { exit !f }' "$@" 2>/dev/null
+}
 
 # Written by run_codex in adversarial_review.sh as the first line of the artifact when Codex gave no final
 # message, whatever the cause (timeout, quota, crash). Only the first non-blank line is tested: a review OF this
@@ -191,7 +209,7 @@ artifact_is_transient_failure() {
     fi
     # Transport errors are timestamped log lines. For the same reason they only count in a transcript, a
     # failure note, or a file that is not a real answer: a review can quote one in a code block.
-    grep -qEi -- "$TRANSIENT_LOG_RE" "$f" 2>/dev/null \
+    has_transport_error "$f" \
         && { artifact_opens_with_codex_banner "$f" || artifact_is_failure_note "$f" \
              || ! artifact_has_real_answer "$f"; }
 }

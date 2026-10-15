@@ -9,6 +9,18 @@ fixes. The version lives in `.claude-plugin/plugin.json`, and
 Installed plugins only update when this version changes, so every release that
 should reach users bumps it.
 
+## 1.0.2 - 2026-10-15
+
+- Fix: a review stalled even though both agents were answering. Codex refreshes
+  its model list on start-up and, when that request is slow, logs `ERROR ...
+  failed to refresh available models: request timed out` before answering
+  normally. That line matched the transport-error pattern, so the probe that waits
+  for a quota reset kept reporting Codex as refused and a supervised run stopped
+  after two hours; a Codex transcript carrying it could also be counted as a
+  refusal. Lines from that background refresh no longer count as a transport
+  error, in the probe or in the artifact check, while real ones (stream
+  disconnected, connection reset, a request that timed out) still do.
+
 ## 1.0.1 - 2026-10-15
 
 - Fix: `run_chunked_review.sh` took a Windows path such as `C:/Users/...` in
