@@ -9,6 +9,16 @@ fixes. The version lives in `.claude-plugin/plugin.json`, and
 Installed plugins only update when this version changes, so every release that
 should reach users bumps it.
 
+## 1.0.3 - 2026-11-18
+
+- The plugin's name in `.claude-plugin/plugin.json` is `adversarial-review` again,
+  matching the marketplace entry and the install command
+  (`/plugin install adversarial-review@herrtunante-tools`). The rename to
+  `adversarial-codex-claude-review` reached only `plugin.json`, so installing under
+  the new name failed silently, and `claude plugin validate` warned that a name
+  containing "claude" reads as one of Anthropic's own plugins.
+- Author name spelling fixed. The plugin icon added before 1.0.2 is unchanged.
+
 ## 1.0.2 - 2026-10-15
 
 - Fix: a review stalled even though both agents were answering. Codex refreshes
